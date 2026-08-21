@@ -80,11 +80,12 @@ jobs:
         env:
           SONAR_TOKEN: ${{ secrets.TWSQPAT }}
         run: |
-          ./mvnw clean verify sonar:sonar \
+          ./mvnw clean verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
             -Dsonar.projectKey=spring-petclinic-rest \
             -Dsonar.projectName="Spring PetClinic REST" \
+            -Dsonar.organization=spring-petclinic \
             -Dsonar.host.url=https://sonarcloud.io \
-            -Dsonar.token=${{ secrets.TWSQPAT }} \
+            -Dsonar.token=$SONAR_TOKEN \
             -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
             -Dsonar.java.source=21
 

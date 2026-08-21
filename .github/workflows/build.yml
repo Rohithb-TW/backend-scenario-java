@@ -81,9 +81,9 @@ jobs:
           SONAR_TOKEN: ${{ secrets.TWSQPAT }}
         run: |
           ./mvnw clean verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
-            -Dsonar.projectKey=spring-petclinic-rest \
-            -Dsonar.projectName="Spring PetClinic REST" \
-            -Dsonar.organization=spring-petclinic \
+            -Dsonar.projectKey=Rohithb-TW \
+            -Dsonar.projectName="Rohithb-TW" \
+            -Dsonar.organization=Rohithb-TW \
             -Dsonar.host.url=https://sonarcloud.io \
             -Dsonar.token=$SONAR_TOKEN \
             -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
@@ -144,5 +144,6 @@ jobs:
         env:
           SNYK_TOKEN: ${{ secrets.TWSSnykPAT }}
         # Only monitor on pushes to main/master (not on PRs) to avoid duplicate snapshots
+        # Note: --project-name is incompatible with --all-projects; Snyk auto-names from manifest
         if: github.event_name == 'push'
-        run: snyk monitor --all-projects --project-name=spring-petclinic-rest
+        run: snyk monitor --all-projects

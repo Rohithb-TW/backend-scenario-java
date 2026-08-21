@@ -81,9 +81,9 @@ jobs:
           SONAR_TOKEN: ${{ secrets.TWSQPAT }}
         run: |
           ./mvnw clean verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
-            -Dsonar.projectKey=Rohithb-TW \
+            -Dsonar.projectKey=rohithb-tw_Rohithb-TW \
             -Dsonar.projectName="Rohithb-TW" \
-            -Dsonar.organization=Rohithb-TW \
+            -Dsonar.organization=rohithb-tw \
             -Dsonar.host.url=https://sonarcloud.io \
             -Dsonar.token=$SONAR_TOKEN \
             -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \

@@ -1,0 +1,14 @@
+.git
+.github
+observability/
+k8s/
+*.md
+*.sh
+*.log
+*.pid
+app.log
+app.pid
+reports/
+.DS_Store
+target/
+!target/spring-petclinic-rest-*.jar

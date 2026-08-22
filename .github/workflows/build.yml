@@ -381,7 +381,8 @@ jobs:
           kind load docker-image "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" --name petclinic-prod
 
       - name: Patch image tag in deployment manifest
-        run: sed -i "s|image: petclinic:.*|image: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}|g" k8s/deployment.yml
+        run: |
+          sed -i "s|image: petclinic:.*|image: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}|g" k8s/deployment.yml
 
       - name: Apply Kubernetes manifests
         run: |

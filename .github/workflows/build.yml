@@ -141,16 +141,9 @@ jobs:
       - name: Run SonarQube analysis
         env:
           SONAR_TOKEN: ${{ secrets.TWSQPAT }}
-          SONAR_HOST_URL: https://sonarcloud.io
-          SONAR_SCANNER_OPTS: >-
-            -Dsonar.projectKey=rohithb-tw_backend-scenario-java
-            -Dsonar.projectName=backend-scenario-java
-            -Dsonar.organization=rohithb-tw
-            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
-            -Dsonar.java.source=21
         run: |
           chmod +x mvnw
-          ./mvnw clean verify org.sonarsource.scanner.maven:sonar-maven-plugin:5.7.0.6970:sonar -q
+          ./mvnw clean verify org.sonarsource.scanner.maven:sonar-maven-plugin:5.7.0.6970:sonar -Dsonar.projectKey=rohithb-tw_backend-scenario-java -Dsonar.projectName=backend-scenario-java -Dsonar.organization=rohithb-tw -Dsonar.host.url=https://sonarcloud.io -Dsonar.token="${SONAR_TOKEN}" -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml -Dsonar.java.source=21 -q
 
       - name: SonarQube summary
         if: always()

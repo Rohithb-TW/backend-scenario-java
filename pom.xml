@@ -20,11 +20,9 @@
     <properties>
 
         <!-- Third-party libraries -->
-        <spring-data-jdbc.version>1.2.1.RELEASE</spring-data-jdbc.version>
         <springdoc-openapi-ui.version>3.0.3</springdoc-openapi-ui.version>
         <jackson-databind.version>2.21.5</jackson-databind.version>
         <jackson-databind-nullable.version>0.2.11</jackson-databind-nullable.version>
-        <spring-retry.version>2.0.13</spring-retry.version>
         <mapstruct.version>1.6.3</mapstruct.version>
         <jaxb-api.version>2.3.1</jaxb-api.version>
 
@@ -107,17 +105,7 @@
             <artifactId>postgresql</artifactId>
             <scope>runtime</scope>
         </dependency>
-        <dependency>
-            <groupId>org.springframework.data</groupId>
-            <artifactId>spring-data-jdbc-core</artifactId>
-            <version>${spring-data-jdbc.version}</version>
-            <exclusions>
-                <exclusion>
-                    <groupId>org.springframework</groupId>
-                    <artifactId>*</artifactId>
-                </exclusion>
-            </exclusions>
-        </dependency>
+
 
         <!-- Test libs -->
         <dependency>
@@ -144,6 +132,7 @@
         <dependency>
             <groupId>tools.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
+            <version>${jackson-databind.version}</version>
         </dependency>
         <dependency>
             <groupId>com.jayway.jsonpath</groupId>

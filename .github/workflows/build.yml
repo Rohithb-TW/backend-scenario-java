@@ -5,13 +5,9 @@ name: "M03 — CI/CD Pipeline (<=5 min to prod)"
 #   push to main/master  →  full pipeline: build → security gates → deploy
 #   pull_request         →  handled exclusively by pr.yml
 #
-# Pipeline timing target (GHA ubuntu-latest):
-#   Phase 1  build-test      ~90 s   (Maven cache hit + -T 1C)
-#   Phase 2  snyk-gate       ~60 s   (parallel with trivy-gate)
-#   Phase 2  trivy-gate      ~75 s   (parallel with snyk-gate)
-#   Phase 4  deploy          ~90 s   (kind cluster + load + rollout)
-#   ────────────────────────────────
-#   Total wall-clock         ~5 min  (phases 2 & 3 overlap with kind setup)
+# Pipeline graph:
+#   build-test ──┬──► snyk-gate   ─┐
+#                └──► sonarqube   ─┴──► trivy-gate ──► deploy ──► pipeline-summary
 # ─────────────────────────────────────────────────────────────────────────────
 on:
   push:
@@ -19,9 +15,9 @@ on:
 
 permissions:
   contents: read
-  security-events: write   # required for SARIF upload to GitHub Security tab
+  security-events: write  # required for SARIF upload to GitHub Security tab
 
-# Cancel any in-progress deploy for the same branch to avoid queued races.
+# Cancel any in-progress run for the same branch to avoid queued races.
 concurrency:
   group: deploy-${{ github.ref }}
   cancel-in-progress: true
@@ -31,7 +27,7 @@ env:
   IMAGE_TAG: ${{ github.sha }}
 
 # ═════════════════════════════════════════════════════════════════════════════
-# PHASE 1 — Build, test, and package  (target: ~90 s)
+# PHASE 1 — Build, test, and package
 # ═════════════════════════════════════════════════════════════════════════════
 jobs:
 
@@ -73,12 +69,8 @@ jobs:
           retention-days: 1
 
 # ═════════════════════════════════════════════════════════════════════════════
-# PHASE 2 — Security gates (parallel; BOTH must pass before deploy)
-#   2a  Snyk SCA        — dependency CVEs
-#   2b  Trivy image     — OS + library CVEs in the Docker image
+# PHASE 2a — Snyk SCA gate (runs parallel with sonarqube)
 # ═════════════════════════════════════════════════════════════════════════════
-
-  # ── 2a: Snyk SCA ────────────────────────────────────────────────────────────
   snyk-gate:
     name: "Snyk SCA Gate"
     runs-on: ubuntu-latest
@@ -111,6 +103,7 @@ jobs:
           SNYK_RC=$?
           set -e
           python3 .github/scripts/snyk_summary.py snyk-report.json "${{ github.sha }}" "$SNYK_RC"
+          exit $SNYK_RC
 
       - name: Upload Snyk report
         if: always()
@@ -120,11 +113,64 @@ jobs:
           path: snyk-report.json
 
       - name: Snyk monitor (upload snapshot to dashboard)
+        if: success()
         env:
           SNYK_TOKEN: ${{ secrets.TWSSnykPAT }}
         run: snyk monitor --all-projects
 
-  # ── 2b: Docker build + Trivy image scan ─────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE 2b — SonarQube SAST (runs parallel with snyk-gate, advisory)
+# ═════════════════════════════════════════════════════════════════════════════
+  sonarqube:
+    name: "SonarQube SAST"
+    runs-on: ubuntu-latest
+    needs: build-test
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Run SonarQube analysis
+        env:
+          SONAR_TOKEN: ${{ secrets.TWSQPAT }}
+          SONAR_PROJECT_KEY: rohithb-tw_backend-scenario-java
+          SONAR_PROJECT_NAME: backend-scenario-java
+          SONAR_ORGANIZATION: rohithb-tw
+          SONAR_HOST_URL: https://sonarcloud.io
+        run: |
+          chmod +x mvnw
+          ./mvnw clean verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar 
+            -Dsonar.projectKey="${SONAR_PROJECT_KEY}" 
+            -Dsonar.projectName="${SONAR_PROJECT_NAME}" 
+            -Dsonar.organization="${SONAR_ORGANIZATION}" 
+            -Dsonar.host.url="${SONAR_HOST_URL}" 
+            -Dsonar.token="${SONAR_TOKEN}" 
+            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml 
+            -Dsonar.java.source=21 -q
+
+      - name: SonarQube summary
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          {
+            echo "## SonarQube SAST (advisory)"
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Result | ${STATUS} |"
+            echo "| Dashboard | [SonarCloud](https://sonarcloud.io/project/overview?id=rohithb-tw_backend-scenario-java) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE 3 — Docker build + Trivy image scan (runs after snyk + sonarqube)
+# ═════════════════════════════════════════════════════════════════════════════
   trivy-gate:
     name: "Docker Build + Trivy Image Gate"
     runs-on: ubuntu-latest
@@ -140,11 +186,11 @@ jobs:
 
       - name: Build Docker image
         run: |
-          docker build \
-            --tag "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" \
-            --label "git.sha=${{ github.sha }}" \
-            --label "git.ref=${{ github.ref_name }}" \
-            --label "build.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          docker build 
+            --tag "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" 
+            --label "git.sha=${{ github.sha }}" 
+            --label "git.ref=${{ github.ref_name }}" 
+            --label "build.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" 
             .
 
       - name: Trivy — fail on Critical/High (hard gate)
@@ -184,11 +230,9 @@ jobs:
         if: always()
         run: python3 .github/scripts/trivy_summary.py trivy.json "${{ github.sha }}"
 
-      # Export the already-scanned image so the deploy job reuses it
-      # without rebuilding (saves ~60 s on the critical path).
       - name: Export image tar
         if: success()
-        run: docker save ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} | gzip > image.tar.gz
+        run: docker save "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" | gzip > image.tar.gz
 
       - name: Upload image tar
         if: success()
@@ -199,58 +243,7 @@ jobs:
           retention-days: 1
 
 # ═════════════════════════════════════════════════════════════════════════════
-# PHASE 3 — SonarQube SAST (advisory — runs parallel to Phase 2)
-#            Set continue-on-error: false to make it a hard gate.
-# ═════════════════════════════════════════════════════════════════════════════
-  sonarqube:
-    name: "SonarQube SAST"
-    runs-on: ubuntu-latest
-    needs: build-test
-    continue-on-error: true
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '21'
-          cache: maven
-
-      - name: Run SonarQube analysis
-        env:
-          SONAR_TOKEN: ${{ secrets.TWSQPAT }}
-          SONAR_PROJECT_KEY: rohithb-tw_backend-scenario-java
-          SONAR_PROJECT_NAME: backend-scenario-java
-          SONAR_ORGANIZATION: rohithb-tw
-          SONAR_HOST_URL: https://sonarcloud.io
-        run: |
-          chmod +x mvnw
-          ./mvnw clean verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
-            -Dsonar.projectKey="${SONAR_PROJECT_KEY}" \
-            -Dsonar.projectName="${SONAR_PROJECT_NAME}" \
-            -Dsonar.organization="${SONAR_ORGANIZATION}" \
-            -Dsonar.host.url="${SONAR_HOST_URL}" \
-            -Dsonar.token="${SONAR_TOKEN}" \
-            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
-            -Dsonar.java.source=21 -q
-
-      - name: SonarQube summary
-        if: always()
-        run: |
-          STATUS="${{ job.status }}"
-          cat >> "$GITHUB_STEP_SUMMARY" << EOF
-          ## SonarQube SAST (advisory)
-          | Result | ${STATUS} |
-          |---|---|
-          | Dashboard | [SonarCloud](https://sonarcloud.io/project/overview?id=rohithb-tw_backend-scenario-java) |
-          EOF
-
-# ═════════════════════════════════════════════════════════════════════════════
-# PHASE 4 — Deploy to kind cluster  (target: start ~t+3 min, done ~t+5 min)
-#            Only runs when BOTH security gates pass.
+# PHASE 4 — Deploy to kind cluster (only when both security gates pass)
 # ═════════════════════════════════════════════════════════════════════════════
   deploy:
     name: "Deploy to kind (production)"
@@ -271,31 +264,24 @@ jobs:
       # ── Provision kind cluster ───────────────────────────────────────────
       - name: Install kind
         run: |
-          curl -sLo /usr/local/bin/kind 
-            "https://kind.sigs.k8s.io/dl/v0.23.0/kind-linux-amd64"
+          curl -sLo /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/v0.23.0/kind-linux-amd64"
           chmod +x /usr/local/bin/kind
 
       - name: Create kind cluster
         run: |
-          kind create cluster 
-            --config k8s/kind-cluster.yml 
-            --wait 60s
+          kind create cluster --config k8s/kind-cluster.yml --wait 60s
           kubectl cluster-info --context kind-petclinic-prod
 
       # ── Load image (no external registry needed) ─────────────────────────
       - name: Load image into kind nodes
         run: |
           docker load < image.tar.gz
-          kind load docker-image 
-            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} 
-            --name petclinic-prod
+          kind load docker-image "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" --name petclinic-prod
 
       # ── Stamp exact SHA into the manifest ────────────────────────────────
       - name: Patch image tag in deployment manifest
         run: |
-          sed -i 
-            "s|image: petclinic:.*|image: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}|g" 
-            k8s/deployment.yml
+          sed -i "s|image: petclinic:.*|image: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}|g" k8s/deployment.yml
 
       # ── Apply manifests ───────────────────────────────────────────────────
       - name: Apply Kubernetes manifests
@@ -307,10 +293,7 @@ jobs:
 
       # ── Wait for rollout ──────────────────────────────────────────────────
       - name: Wait for rollout
-        run: |
-          kubectl rollout status deployment/petclinic 
-            --namespace petclinic 
-            --timeout=120s
+        run: kubectl rollout status deployment/petclinic --namespace petclinic --timeout=120s
 
       # ── Smoke test ────────────────────────────────────────────────────────
       - name: Smoke test — health endpoint
@@ -318,8 +301,7 @@ jobs:
         run: |
           echo "Waiting for app to become ready..."
           for i in $(seq 1 18); do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" 
-              http://localhost:30080/petclinic/actuator/health 2>/dev/null || echo "000")
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:30080/petclinic/actuator/health 2>/dev/null || echo "000")
             echo "  attempt $i — HTTP ${CODE}"
             if [ "${CODE}" = "200" ]; then
               echo "healthy=true" >> "$GITHUB_OUTPUT"
@@ -332,31 +314,23 @@ jobs:
           echo "App did not become healthy within 180 s"
           exit 1
 
-      # ── Collect all kubectl evidence ──────────────────────────────────────
+      # ── Collect kubectl evidence ──────────────────────────────────────────
       - name: Collect kubectl evidence
         if: always()
         run: |
           NS=petclinic
           mkdir -p /tmp/evidence
-
-          kubectl get pods -n ${NS} -o wide                             > /tmp/evidence/pods.txt     2>&1
-          kubectl get deployments -n ${NS} -o wide                     > /tmp/evidence/deployments.txt 2>&1
-          kubectl get svc -n ${NS}                                     > /tmp/evidence/services.txt  2>&1
-          kubectl describe deployment/petclinic -n ${NS}               > /tmp/evidence/describe.txt  2>&1
-          kubectl get events -n ${NS} --sort-by='.lastTimestamp'       > /tmp/evidence/events.txt    2>&1
-          kubectl top pods -n ${NS} 2>/dev/null                        > /tmp/evidence/top.txt       
-            || echo "(metrics-server not installed)"                  >> /tmp/evidence/top.txt
-
-          # Per-pod logs
+          kubectl get pods -n ${NS} -o wide > /tmp/evidence/pods.txt 2>&1
+          kubectl get deployments -n ${NS} -o wide > /tmp/evidence/deployments.txt 2>&1
+          kubectl get svc -n ${NS} > /tmp/evidence/services.txt 2>&1
+          kubectl describe deployment/petclinic -n ${NS} > /tmp/evidence/describe.txt 2>&1
+          kubectl get events -n ${NS} --sort-by='.lastTimestamp' > /tmp/evidence/events.txt 2>&1
+          kubectl top pods -n ${NS} > /tmp/evidence/top.txt 2>/dev/null || echo "(metrics-server not installed)" >> /tmp/evidence/top.txt
           for POD in $(kubectl get pods -n ${NS} -o name 2>/dev/null); do
             echo "=== ${POD} ===" >> /tmp/evidence/pod-logs.txt
             kubectl logs "${POD}" -n ${NS} --tail=50 >> /tmp/evidence/pod-logs.txt 2>&1
           done
-
-          # Health endpoint body
-          curl -s http://localhost:30080/petclinic/actuator/health 
-            > /tmp/evidence/health.json 2>/dev/null 
-            || echo '{"status":"unreachable"}' > /tmp/evidence/health.json
+          curl -s http://localhost:30080/petclinic/actuator/health > /tmp/evidence/health.json 2>/dev/null || echo '{"status":"unreachable"}' > /tmp/evidence/health.json
 
       - name: Upload kubectl evidence
         if: always()
@@ -366,21 +340,13 @@ jobs:
           path: /tmp/evidence/
           retention-days: 7
 
-      # ── Write the GitHub Step Summary (full proof of deployment) ──────────
+      # ── Write the GitHub Step Summary ─────────────────────────────────────
       - name: Write deployment summary
         if: always()
         run: |
-          NS=petclinic
           DEPLOY_TIME="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           HEALTHY="${{ steps.smoke.outputs.healthy }}"
           HEALTH_STATUS="$([ "$HEALTHY" = "true" ] && echo "PASSING" || echo "FAILING")"
-          HEALTH_BODY="$(cat /tmp/evidence/health.json 2>/dev/null || echo 'unreachable')"
-          POD_TABLE="$(cat /tmp/evidence/pods.txt 2>/dev/null)"
-          DEPLOY_TABLE="$(cat /tmp/evidence/deployments.txt 2>/dev/null)"
-          SVC_TABLE="$(cat /tmp/evidence/services.txt 2>/dev/null)"
-          EVENTS="$(tail -20 /tmp/evidence/events.txt 2>/dev/null)"
-          POD_LOGS="$(cat /tmp/evidence/pod-logs.txt 2>/dev/null)"
-
           {
             echo ""
             echo "---"
@@ -398,32 +364,17 @@ jobs:
             echo ""
             echo "## Pod Status"
             echo '```'
-            echo "${POD_TABLE}"
-            echo '```'
-            echo ""
-            echo "## Deployment"
-            echo '```'
-            echo "${DEPLOY_TABLE}"
-            echo '```'
-            echo ""
-            echo "## Services"
-            echo '```'
-            echo "${SVC_TABLE}"
+            cat /tmp/evidence/pods.txt 2>/dev/null || echo "unavailable"
             echo '```'
             echo ""
             echo "## Health Endpoint Response"
             echo '```json'
-            echo "${HEALTH_BODY}"
+            cat /tmp/evidence/health.json 2>/dev/null || echo "unreachable"
             echo '```'
             echo ""
             echo "## Recent Events"
             echo '```'
-            echo "${EVENTS}"
-            echo '```'
-            echo ""
-            echo "## Pod Logs (last 50 lines)"
-            echo '```'
-            echo "${POD_LOGS}"
+            tail -20 /tmp/evidence/events.txt 2>/dev/null || echo "unavailable"
             echo '```'
             echo ""
             echo "> Security promise kept: Snyk SCA and Trivy image gates passed."
@@ -448,12 +399,14 @@ jobs:
           SONAR="${{ needs.sonarqube.result }}"
           DEPLOY="${{ needs.deploy.result }}"
 
-          ok()  { [ "$1" = "success" ] && echo "OK"      || echo "FAILED"; }
-          skip(){ [ "$1" = "skipped" ] && echo "SKIPPED" || echo "$(ok "$1")"; }
+          result() { [ "$1" = "success" ] && echo "✅ PASSED" || ([ "$1" = "skipped" ] && echo "⏭️ SKIPPED" || echo "❌ FAILED"); }
 
-          OVERALL="ALL STAGES PASSED"
+          OVERALL="✅ ALL STAGES PASSED"
           for r in "$BUILD" "$SNYK" "$TRIVY" "$DEPLOY"; do
-            [ "$r" != "success" ] && OVERALL="PIPELINE FAILED" && break
+            if [ "$r" != "success" ]; then
+              OVERALL="❌ PIPELINE FAILED"
+              break
+            fi
           done
 
           {
@@ -464,11 +417,11 @@ jobs:
             echo ""
             echo "| Stage | Job | Result |"
             echo "|---|---|---|"
-            echo "| Phase 1 | Build and Test      | $(ok $BUILD) |"
-            echo "| Phase 2 | Snyk SCA Gate       | $(ok $SNYK) |"
-            echo "| Phase 2 | Trivy Image Gate    | $(ok $TRIVY) |"
-            echo "| Phase 3 | SonarQube SAST      | $(skip $SONAR) (advisory) |"
-            echo "| Phase 4 | Deploy to kind      | $(skip $DEPLOY) |"
+            echo "| Phase 1 | Build and Test   | $(result $BUILD) |"
+            echo "| Phase 2 | Snyk SCA Gate    | $(result $SNYK) |"
+            echo "| Phase 2 | SonarQube SAST   | $(result $SONAR) (advisory) |"
+            echo "| Phase 3 | Trivy Image Gate | $(result $TRIVY) |"
+            echo "| Phase 4 | Deploy to kind   | $(result $DEPLOY) |"
             echo ""
             echo "## ${OVERALL}"
             echo ""

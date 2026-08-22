@@ -5,14 +5,16 @@ name: "PR Gate"
 # Hard gates (merge blocked if any fail):
 #   - Build & unit tests
 #   - Snyk SCA (Critical/High dependency CVEs)
-#   - Docker image build succeeds + Trivy image scan (Critical/High)
+#   - Docker image build + Trivy image scan (Critical/High)
 #   - OWASP Dependency-Check (CVSS >= 7)
-# Advisory (result posted to summary, does not block):
-#   - SonarQube quality gate
 # ─────────────────────────────────────────────────────────────────────────────
 on:
   pull_request:
     branches: [main, master]
+
+permissions:
+  contents: read
+  security-events: write  # required for SARIF upload to GitHub Security tab
 
 # Cancel stale runs when new commits are pushed to the same PR.
 concurrency:
@@ -44,7 +46,7 @@ jobs:
       - name: Build and verify
         run: |
           chmod +x mvnw
-          ./mvnw clean verify -T 1C
+          ./mvnw clean verify -T 1C -q
 
       - name: Publish test summary
         if: always()
@@ -96,14 +98,11 @@ jobs:
         run: |
           snyk auth "$SNYK_TOKEN"
           set +e
-          snyk test --all-projects --severity-threshold=high 
-            --json-file-output=snyk-pr-report.json
+          snyk test --all-projects --severity-threshold=high --json-file-output=snyk-pr-report.json
           SNYK_RC=$?
           set -e
-          python3 .github/scripts/snyk_summary.py 
-            snyk-pr-report.json 
-            "PR #${{ github.event.pull_request.number }}" 
-            "$SNYK_RC"
+          python3 .github/scripts/snyk_summary.py snyk-pr-report.json "PR #${{ github.event.pull_request.number }}" "$SNYK_RC"
+          exit $SNYK_RC
 
       - name: Upload Snyk report
         if: always()
@@ -131,13 +130,13 @@ jobs:
       - name: Build Docker image
         run: |
           docker build 
-            --tag ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} 
+            --tag "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" 
             --label "pr=${{ github.event.pull_request.number }}" 
             --label "sha=${{ github.sha }}" 
             .
 
       - name: Trivy — fail on Critical/High (hard gate)
-        uses: aquasecurity/trivy-action@0.30.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
           format: table
@@ -147,7 +146,7 @@ jobs:
 
       - name: Trivy — SARIF (GitHub Security tab)
         if: always()
-        uses: aquasecurity/trivy-action@0.30.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
           format: sarif
@@ -156,13 +155,13 @@ jobs:
 
       - name: Upload SARIF
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-pr.sarif
 
       - name: Trivy — JSON for summary
         if: always()
-        uses: aquasecurity/trivy-action@0.30.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
           format: json
@@ -171,10 +170,7 @@ jobs:
 
       - name: Publish Trivy summary
         if: always()
-        run: |
-          python3 .github/scripts/trivy_summary.py 
-            trivy-pr.json 
-            "PR #${{ github.event.pull_request.number }}"
+        run: python3 .github/scripts/trivy_summary.py trivy-pr.json "PR #${{ github.event.pull_request.number }}"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Job 4 — OWASP Dependency-Check (hard gate: CVSS >= 7)
@@ -197,16 +193,11 @@ jobs:
         run: |
           chmod +x mvnw
           set +e
-          ./mvnw org.owasp:dependency-check-maven:check 
-            -DfailBuildOnCVSS=7 
-            -Dformat=JSON 
-            -q
+          ./mvnw org.owasp:dependency-check-maven:check -DfailBuildOnCVSS=7 -Dformat=JSON -q
           OWASP_RC=$?
           set -e
-          python3 .github/scripts/owasp_summary.py 
-            target/dependency-check-report.json 
-            "PR #${{ github.event.pull_request.number }}" 
-            "$OWASP_RC"
+          python3 .github/scripts/owasp_summary.py target/dependency-check-report.json "PR #${{ github.event.pull_request.number }}" "$OWASP_RC"
+          exit $OWASP_RC
 
       - name: Upload OWASP report
         if: always()
@@ -233,11 +224,14 @@ jobs:
           IMAGE="${{ needs.image-scan.result }}"
           OWASP="${{ needs.owasp-dc.result }}"
 
-          ok() { [ "$1" = "success" ] && echo "OK" || echo "FAILED"; }
+          result() { [ "$1" = "success" ] && echo "✅ PASSED" || ([ "$1" = "skipped" ] && echo "⏭️ SKIPPED" || echo "❌ FAILED"); }
 
-          OVERALL="All gates passed — safe to merge"
+          OVERALL="✅ All gates passed — safe to merge"
           for r in "$BUILD" "$SNYK" "$IMAGE" "$OWASP"; do
-            [ "$r" != "success" ] && OVERALL="Gate(s) failed — merge is blocked" && break
+            if [ "$r" != "success" ]; then
+              OVERALL="❌ Gate(s) failed — merge is blocked"
+              break
+            fi
           done
 
           {
@@ -248,10 +242,10 @@ jobs:
             echo ""
             echo "| Gate | Result |"
             echo "|---|---|"
-            echo "| Build and Tests   | $(ok $BUILD) |"
-            echo "| Snyk SCA          | $(ok $SNYK) |"
-            echo "| Docker + Trivy    | $(ok $IMAGE) |"
-            echo "| OWASP Dep-Check   | $(ok $OWASP) |"
+            echo "| Build and Tests | $(result $BUILD) |"
+            echo "| Snyk SCA        | $(result $SNYK) |"
+            echo "| Docker + Trivy  | $(result $IMAGE) |"
+            echo "| OWASP Dep-Check | $(result $OWASP) |"
             echo ""
             echo "### ${OVERALL}"
             echo ""

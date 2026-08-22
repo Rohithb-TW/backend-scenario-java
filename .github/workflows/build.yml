@@ -221,25 +221,25 @@ jobs:
           SONAR_TOKEN: ${{ secrets.TWSQPAT }}
         run: |
           chmod +x mvnw
-          ./mvnw clean verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar 
-            -Dsonar.projectKey=rohithb-tw_Rohithb-TW 
-            -Dsonar.projectName="Rohithb-TW" 
-            -Dsonar.organization=rohithb-tw 
-            -Dsonar.host.url=https://sonarcloud.io 
-            -Dsonar.token=$SONAR_TOKEN 
-            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml 
+          ./mvnw clean verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
+            -Dsonar.projectKey=rohithb-tw_backend-scenario-java \
+            -Dsonar.projectName="backend-scenario-java" \
+            -Dsonar.organization=rohithb-tw \
+            -Dsonar.host.url=https://sonarcloud.io \
+            -Dsonar.token=$SONAR_TOKEN \
+            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
             -Dsonar.java.source=21 -q
 
-      - name: SonarQube summary
-        if: always()
-        run: |
+          - name: SonarQube summary
+          if: always()
+          run: |
           STATUS="${{ job.status }}"
           EMOJI="$([ "$STATUS" = "success" ] && echo "OK" || echo "WARNING")"
           cat >> "$GITHUB_STEP_SUMMARY" << EOF
           ## SonarQube SAST (advisory)
           | Result | ${STATUS} |
           |---|---|
-          | Dashboard | [SonarCloud](https://sonarcloud.io/project/overview?id=rohithb-tw_Rohithb-TW) |
+          | Dashboard | [SonarCloud](https://sonarcloud.io/project/overview?id=rohithb-tw_backend-scenario-java) |
           EOF
 
 # ═════════════════════════════════════════════════════════════════════════════

@@ -483,11 +483,11 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <configuration>
-                    <!-- Run test classes in parallel across 4 threads (~35s saved) -->
-                    <parallel>classes</parallel>
-                    <threadCount>4</threadCount>
-                    <forkCount>1</forkCount>
-                    <reuseForks>true</reuseForks>
+                    <!-- Run up to 4 test classes concurrently, each in its own JVM fork.
+                         reuseForks=false ensures named in-memory DBs (H2, HSQLDB) are fully
+                         isolated per class — no DB state collisions between test classes. -->
+                    <forkCount>4</forkCount>
+                    <reuseForks>false</reuseForks>
                 </configuration>
             </plugin>
         </plugins>

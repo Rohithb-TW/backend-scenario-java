@@ -68,6 +68,13 @@ jobs:
           path: target/spring-petclinic-rest-*.jar
           retention-days: 1
 
+      - name: Upload JaCoCo coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: jacoco-report-${{ github.sha }}
+          path: target/site/jacoco/
+          retention-days: 1
+
 # ═════════════════════════════════════════════════════════════════════════════
 # PHASE 2a — Snyk SCA gate (runs parallel with sonarqube)
 # ═════════════════════════════════════════════════════════════════════════════
@@ -138,12 +145,24 @@ jobs:
           java-version: '21'
           cache: maven
 
+      - name: Download JAR (reuse build-test output)
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar-${{ github.sha }}
+          path: target/
+
+      - name: Download JaCoCo report (reuse build-test coverage)
+        uses: actions/download-artifact@v4
+        with:
+          name: jacoco-report-${{ github.sha }}
+          path: target/site/jacoco/
+
       - name: Run SonarQube analysis
         env:
           SONAR_TOKEN: ${{ secrets.TWSQPAT }}
         run: |
           chmod +x mvnw
-          ./mvnw clean verify org.sonarsource.scanner.maven:sonar-maven-plugin:5.7.0.6970:sonar -Dsonar.projectKey=rohithb-tw_backend-scenario-java -Dsonar.projectName=backend-scenario-java -Dsonar.organization=rohithb-tw -Dsonar.host.url=https://sonarcloud.io -Dsonar.token="${SONAR_TOKEN}" -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml -Dsonar.java.source=21 -q
+          ./mvnw package org.sonarsource.scanner.maven:sonar-maven-plugin:5.7.0.6970:sonar -DskipTests -Dsonar.projectKey=rohithb-tw_backend-scenario-java -Dsonar.projectName=backend-scenario-java -Dsonar.organization=rohithb-tw -Dsonar.host.url=https://sonarcloud.io -Dsonar.token="${SONAR_TOKEN}" -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml -Dsonar.java.source=21 -q
 
       - name: SonarQube summary
         if: always()
@@ -247,8 +266,10 @@ jobs:
       # ── Provision kind cluster ───────────────────────────────────────────
       - name: Install kind
         run: |
-          curl -sLo /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/v0.23.0/kind-linux-amd64"
-          chmod +x /usr/local/bin/kind
+          mkdir -p "$HOME/bin"
+          curl -sLo "$HOME/bin/kind" "https://kind.sigs.k8s.io/dl/v0.23.0/kind-linux-amd64"
+          chmod +x "$HOME/bin/kind"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
 
       - name: Create kind cluster
         run: |

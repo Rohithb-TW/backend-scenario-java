@@ -17,6 +17,10 @@ on:
   push:
     branches: [main, master]
 
+permissions:
+  contents: read
+  security-events: write   # required for SARIF upload to GitHub Security tab
+
 # Cancel any in-progress deploy for the same branch to avoid queued races.
 concurrency:
   group: deploy-${{ github.ref }}
@@ -163,7 +167,7 @@ jobs:
 
       - name: Upload SARIF to GitHub Security
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy.sarif
 

@@ -1,0 +1,9 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: 'petclinic-api'
+    metrics_path: /petclinic/actuator/prometheus
+    static_configs:
+      - targets:
+          - host.lima.internal:9966

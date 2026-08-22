@@ -3,17 +3,37 @@ name: Build
 on:
   push:
     branches:
-      - main
-      - master
+      - feature-k8sdeploy
   pull_request:
 
 jobs:
+  # ──────────────────────────────────────────────
+  # Job 0: Secret scan gate
+  # GitHub Actions cannot stop a local git push before it reaches GitHub,
+  # but this check can be enforced with branch protection to block merges.
+  # ──────────────────────────────────────────────
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   # ──────────────────────────────────────────────
   # Job 1: Compile, test, and verify the project
   # ──────────────────────────────────────────────
   build:
     name: Build & Test
     runs-on: ubuntu-latest
+    needs: secret-scan
 
     steps:
       - name: Checkout source code
@@ -32,14 +52,19 @@ jobs:
       - name: Build and verify with Maven
         run: ./mvnw clean verify
 
-      # Cache the local Maven repository so parallel jobs can reuse it
-      - name: Cache Maven local repository
-        uses: actions/cache@v4
+      - name: Upload application jar
+        uses: actions/upload-artifact@v4
         with:
-          path: ~/.m2/repository
-          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            maven-${{ runner.os }}-
+          name: app-jar
+          path: target/spring-petclinic-rest-4.0.2.jar
+
+      - name: Upload Kubernetes manifests
+        uses: actions/upload-artifact@v4
+        with:
+          name: k8s-manifests
+          path: |
+            k8s/deployment.yaml
+            k8s/service.yaml
 
   # ──────────────────────────────────────────────
   # Job 2: SonarQube static analysis (SAST + quality gates)
@@ -55,7 +80,6 @@ jobs:
       - name: Checkout source code
         uses: actions/checkout@v4
         with:
-          # Fetch full history for accurate blame/coverage data
           fetch-depth: 0
 
       - name: Set up JDK 21
@@ -65,29 +89,30 @@ jobs:
           java-version: '21'
           cache: maven
 
-      - name: Restore Maven local repository cache
+      - name: Cache SonarQube packages
         uses: actions/cache@v4
         with:
-          path: ~/.m2/repository
-          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+          path: ~/.sonar/cache
+          key: sonar-${{ runner.os }}
           restore-keys: |
-            maven-${{ runner.os }}-
+            sonar-${{ runner.os }}
 
       - name: Make Maven wrapper executable
         run: chmod +x mvnw
 
-      - name: Run SonarQube analysis
+      - name: Run SonarQube analysis with quality gate wait
         env:
           SONAR_TOKEN: ${{ secrets.TWSQPAT }}
         run: |
-          ./mvnw clean verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
+          ./mvnw verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
             -Dsonar.projectKey=rohithb-tw_Rohithb-TW \
             -Dsonar.projectName="Rohithb-TW" \
             -Dsonar.organization=rohithb-tw \
             -Dsonar.host.url=https://sonarcloud.io \
             -Dsonar.token=$SONAR_TOKEN \
             -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
-            -Dsonar.java.source=21
+            -Dsonar.java.source=21 \
+            -Dsonar.qualitygate.wait=true
 
   # ──────────────────────────────────────────────
   # Job 3: Snyk security scan (SCA + dependency vulnerabilities)
@@ -110,19 +135,8 @@ jobs:
           java-version: '21'
           cache: maven
 
-      - name: Restore Maven local repository cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.m2/repository
-          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            maven-${{ runner.os }}-
-
       - name: Make Maven wrapper executable
         run: chmod +x mvnw
-
-      - name: Build project (needed for Snyk dependency resolution)
-        run: ./mvnw clean package -DskipTests
 
       - name: Install Snyk CLI
         run: npm install -g snyk
@@ -135,15 +149,115 @@ jobs:
       - name: Run Snyk dependency vulnerability test
         env:
           SNYK_TOKEN: ${{ secrets.TWSSnykPAT }}
-        # --all-projects scans all Maven modules
-        # --severity-threshold=high  → fail only on high/critical vulns
-        # || true                    → don't fail the pipeline on found vulns (optional: remove to enforce)
-        run: snyk test --all-projects --severity-threshold=high || true
+        run: snyk test --all-projects --severity-threshold=high
 
       - name: Monitor project with Snyk (uploads snapshot to Snyk dashboard)
         env:
           SNYK_TOKEN: ${{ secrets.TWSSnykPAT }}
-        # Only monitor on pushes to main/master (not on PRs) to avoid duplicate snapshots
-        # Note: --project-name is incompatible with --all-projects; Snyk auto-names from manifest
         if: github.event_name == 'push'
         run: snyk monitor --all-projects
+
+  # ──────────────────────────────────────────────
+  # Job 4: Build container image after quality gates pass
+  # ──────────────────────────────────────────────
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    needs:
+      - sonarqube
+      - snyk
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Download application jar
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: target
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          tags: spring-petclinic-rest:ci
+          build-args: |
+            JAR_FILE=target/spring-petclinic-rest-4.0.2.jar
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Save Docker image as artifact
+        run: docker save spring-petclinic-rest:ci -o spring-petclinic-rest-ci.tar
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: spring-petclinic-rest-ci.tar
+
+  # ──────────────────────────────────────────────
+  # Job 5: Deploy to temporary Kind cluster on GitHub-hosted runner
+  # Cluster exists only for the lifetime of this job.
+  # ──────────────────────────────────────────────
+  deploy-kind:
+    name: Deploy to Kind
+    runs-on: ubuntu-latest
+    needs: docker-build
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+          path: .
+
+      - name: Download Kubernetes manifests
+        uses: actions/download-artifact@v4
+        with:
+          name: k8s-manifests
+          path: k8s
+
+      - name: Create Kind cluster
+        uses: helm/kind-action@v1.10.0
+        with:
+          cluster_name: prod-validation
+          wait: 120s
+
+      - name: Load Docker image into local daemon
+        run: docker load -i spring-petclinic-rest-ci.tar
+
+      - name: Load image into Kind cluster
+        run: kind load docker-image spring-petclinic-rest:ci --name prod-validation
+
+      - name: Deploy application to Kind
+        run: |
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
+
+      - name: Wait for deployment rollout
+        run: kubectl rollout status deployment/spring-petclinic-rest --timeout=180s
+
+      - name: Verify application health endpoint
+        run: |
+          kubectl port-forward svc/spring-petclinic-rest 9966:80 >/tmp/kubectl-port-forward.log 2>&1 &
+          PORT_FORWARD_PID=$!
+          trap 'kill ${PORT_FORWARD_PID}' EXIT
+          sleep 10
+          curl --fail --silent http://127.0.0.1:9966/petclinic/actuator/health
+
+      - name: Post-deployment status
+        run: |
+          kubectl get pods -A
+          kubectl get deployments -A
+          kubectl get services -A

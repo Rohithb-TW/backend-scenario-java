@@ -1,0 +1,14 @@
+name: PR Summary
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+
+jobs:
+  pr-summary:
+    name: Generate PR Summary
+    uses: ./.github/workflows/reusable-pr-summary.yml

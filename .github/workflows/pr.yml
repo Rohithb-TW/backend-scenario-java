@@ -128,12 +128,7 @@ jobs:
           path: target/
 
       - name: Build Docker image
-        run: |
-          docker build 
-            --tag "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" 
-            --label "pr=${{ github.event.pull_request.number }}" 
-            --label "sha=${{ github.sha }}" 
-            .
+        run: docker build --tag "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" --label "pr=${{ github.event.pull_request.number }}" --label "sha=${{ github.sha }}" .
 
       - name: Trivy — fail on Critical/High (hard gate)
         uses: aquasecurity/trivy-action@v0.36.0

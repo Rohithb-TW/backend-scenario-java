@@ -103,8 +103,7 @@ jobs:
         run: |
           snyk auth "$SNYK_TOKEN"
           set +e
-          snyk test --all-projects --severity-threshold=high 
-            --json-file-output=snyk-report.json
+          snyk test --all-projects --severity-threshold=high --json-file-output=snyk-report.json
           SNYK_RC=$?
           set -e
           python3 .github/scripts/snyk_summary.py snyk-report.json "${{ github.sha }}" "$SNYK_RC"
@@ -125,7 +124,7 @@ jobs:
   trivy-gate:
     name: "Docker Build + Trivy Image Gate"
     runs-on: ubuntu-latest
-    needs: build-test
+    needs: [build-test, snyk-gate, sonarqube]
 
     steps:
       - uses: actions/checkout@v4
@@ -219,22 +218,25 @@ jobs:
       - name: Run SonarQube analysis
         env:
           SONAR_TOKEN: ${{ secrets.TWSQPAT }}
+          SONAR_PROJECT_KEY: rohithb-tw_backend-scenario-java
+          SONAR_PROJECT_NAME: backend-scenario-java
+          SONAR_ORGANIZATION: rohithb-tw
+          SONAR_HOST_URL: https://sonarcloud.io
         run: |
           chmod +x mvnw
           ./mvnw clean verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
-            -Dsonar.projectKey=rohithb-tw_backend-scenario-java \
-            -Dsonar.projectName="backend-scenario-java" \
-            -Dsonar.organization=rohithb-tw \
-            -Dsonar.host.url=https://sonarcloud.io \
-            -Dsonar.token=$SONAR_TOKEN \
+            -Dsonar.projectKey="${SONAR_PROJECT_KEY}" \
+            -Dsonar.projectName="${SONAR_PROJECT_NAME}" \
+            -Dsonar.organization="${SONAR_ORGANIZATION}" \
+            -Dsonar.host.url="${SONAR_HOST_URL}" \
+            -Dsonar.token="${SONAR_TOKEN}" \
             -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
             -Dsonar.java.source=21 -q
 
-          - name: SonarQube summary
-          if: always()
-          run: |
+      - name: SonarQube summary
+        if: always()
+        run: |
           STATUS="${{ job.status }}"
-          EMOJI="$([ "$STATUS" = "success" ] && echo "OK" || echo "WARNING")"
           cat >> "$GITHUB_STEP_SUMMARY" << EOF
           ## SonarQube SAST (advisory)
           | Result | ${STATUS} |

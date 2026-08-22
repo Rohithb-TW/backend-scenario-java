@@ -1,0 +1,266 @@
+name: "PR Gate"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Runs on every pull-request targeting main/master.
+# Hard gates (merge blocked if any fail):
+#   - Build & unit tests
+#   - Snyk SCA (Critical/High dependency CVEs)
+#   - Docker image build succeeds + Trivy image scan (Critical/High)
+#   - OWASP Dependency-Check (CVSS >= 7)
+# Advisory (result posted to summary, does not block):
+#   - SonarQube quality gate
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  pull_request:
+    branches: [main, master]
+
+# Cancel stale runs when new commits are pushed to the same PR.
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: petclinic
+  IMAGE_TAG: pr-${{ github.event.pull_request.number }}-${{ github.sha }}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Job 1 — Build & Test
+# ═════════════════════════════════════════════════════════════════════════════
+jobs:
+
+  build-test:
+    name: "Build & Test"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Build and verify
+        run: |
+          chmod +x mvnw
+          ./mvnw clean verify -T 1C
+
+      - name: Publish test summary
+        if: always()
+        run: python3 .github/scripts/test_summary.py
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-pr${{ github.event.pull_request.number }}
+          path: target/surefire-reports/
+          retention-days: 7
+
+      - name: Upload JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar-pr${{ github.event.pull_request.number }}
+          path: target/spring-petclinic-rest-*.jar
+          retention-days: 1
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Job 2 — Snyk SCA (hard gate)
+# ═════════════════════════════════════════════════════════════════════════════
+  snyk-pr:
+    name: "Snyk SCA Gate"
+    runs-on: ubuntu-latest
+    needs: build-test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-jar-pr${{ github.event.pull_request.number }}
+          path: target/
+
+      - name: Install Snyk CLI
+        run: npm install -g snyk --silent
+
+      - name: Snyk test — fail on Critical/High
+        env:
+          SNYK_TOKEN: ${{ secrets.TWSSnykPAT }}
+        run: |
+          snyk auth "$SNYK_TOKEN"
+          set +e
+          snyk test --all-projects --severity-threshold=high 
+            --json-file-output=snyk-pr-report.json
+          SNYK_RC=$?
+          set -e
+          python3 .github/scripts/snyk_summary.py 
+            snyk-pr-report.json 
+            "PR #${{ github.event.pull_request.number }}" 
+            "$SNYK_RC"
+
+      - name: Upload Snyk report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snyk-pr-report-${{ github.event.pull_request.number }}
+          path: snyk-pr-report.json
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Job 3 — Docker build + Trivy image scan (hard gate)
+# ═════════════════════════════════════════════════════════════════════════════
+  image-scan:
+    name: "Docker Build + Trivy Image Gate"
+    runs-on: ubuntu-latest
+    needs: build-test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-jar-pr${{ github.event.pull_request.number }}
+          path: target/
+
+      - name: Build Docker image
+        run: |
+          docker build 
+            --tag ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} 
+            --label "pr=${{ github.event.pull_request.number }}" 
+            --label "sha=${{ github.sha }}" 
+            .
+
+      - name: Trivy — fail on Critical/High (hard gate)
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          format: table
+          exit-code: '1'
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+      - name: Trivy — SARIF (GitHub Security tab)
+        if: always()
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          format: sarif
+          output: trivy-pr.sarif
+          severity: CRITICAL,HIGH
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-pr.sarif
+
+      - name: Trivy — JSON for summary
+        if: always()
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          format: json
+          output: trivy-pr.json
+          severity: CRITICAL,HIGH
+
+      - name: Publish Trivy summary
+        if: always()
+        run: |
+          python3 .github/scripts/trivy_summary.py 
+            trivy-pr.json 
+            "PR #${{ github.event.pull_request.number }}"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Job 4 — OWASP Dependency-Check (hard gate: CVSS >= 7)
+# ═════════════════════════════════════════════════════════════════════════════
+  owasp-dc:
+    name: "OWASP Dependency-Check"
+    runs-on: ubuntu-latest
+    needs: build-test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Run OWASP Dependency-Check
+        run: |
+          chmod +x mvnw
+          set +e
+          ./mvnw org.owasp:dependency-check-maven:check 
+            -DfailBuildOnCVSS=7 
+            -Dformat=JSON 
+            -q
+          OWASP_RC=$?
+          set -e
+          python3 .github/scripts/owasp_summary.py 
+            target/dependency-check-report.json 
+            "PR #${{ github.event.pull_request.number }}" 
+            "$OWASP_RC"
+
+      - name: Upload OWASP report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: owasp-dc-pr${{ github.event.pull_request.number }}
+          path: target/dependency-check-report.*
+          retention-days: 7
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Job 5 — PR Gate Summary (always runs)
+# ═════════════════════════════════════════════════════════════════════════════
+  pr-summary:
+    name: "PR Gate Summary"
+    runs-on: ubuntu-latest
+    needs: [build-test, snyk-pr, image-scan, owasp-dc]
+    if: always()
+
+    steps:
+      - name: Write PR gate summary
+        run: |
+          BUILD="${{ needs.build-test.result }}"
+          SNYK="${{ needs.snyk-pr.result }}"
+          IMAGE="${{ needs.image-scan.result }}"
+          OWASP="${{ needs.owasp-dc.result }}"
+
+          ok() { [ "$1" = "success" ] && echo "OK" || echo "FAILED"; }
+
+          OVERALL="All gates passed — safe to merge"
+          for r in "$BUILD" "$SNYK" "$IMAGE" "$OWASP"; do
+            [ "$r" != "success" ] && OVERALL="Gate(s) failed — merge is blocked" && break
+          done
+
+          {
+            echo ""
+            echo "---"
+            echo ""
+            echo "## PR Gate — PR #${{ github.event.pull_request.number }}"
+            echo ""
+            echo "| Gate | Result |"
+            echo "|---|---|"
+            echo "| Build and Tests   | $(ok $BUILD) |"
+            echo "| Snyk SCA          | $(ok $SNYK) |"
+            echo "| Docker + Trivy    | $(ok $IMAGE) |"
+            echo "| OWASP Dep-Check   | $(ok $OWASP) |"
+            echo ""
+            echo "### ${OVERALL}"
+            echo ""
+            echo "| Field  | Value |"
+            echo "|---|---|"
+            echo "| Commit | `${{ github.sha }}` |"
+            echo "| Branch | `${{ github.head_ref }}` |"
+            echo "| Target | `${{ github.base_ref }}` |"
+            echo "| Author | @${{ github.event.pull_request.user.login }} |"
+            echo ""
+            echo "> Security promise: No Critical or High CVE may merge into ${{ github.base_ref }}."
+          } >> "$GITHUB_STEP_SUMMARY"

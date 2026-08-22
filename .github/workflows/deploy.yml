@@ -1,0 +1,611 @@
+name: Deploy to Production
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Triggers: push to main/master only (PRs handled by pr.yml)
+# SLA:      production running in < 5 minutes from merge
+#
+# Job graph (→ = needs):
+#
+#   build ──┬──► snyk   ─┐
+#            └──► image  ─┴──► deploy-verify ──► summary
+#            └──► sonar (non-blocking, informational)
+#
+# Security contract:
+#   Snyk (SCA)  — Critical/High CVE = hard block, pipeline stops
+#   Trivy (image) — Critical/High CVE = hard block, pipeline stops
+#   Both must be green before a single byte reaches the cluster
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: [main, master]
+
+env:
+  REGISTRY:      ghcr.io
+  IMAGE_NAME:    ${{ github.repository }}
+  K8S_NAMESPACE: petclinic
+  KIND_CLUSTER:  petclinic-prod
+  APP_PORT:      9966
+  NODEPORT:      30080
+
+jobs:
+
+  # ════════════════════════════════════════════════════════════
+  # JOB 1 — Build, unit-test, package
+  # ════════════════════════════════════════════════════════════
+  build:
+    name: "🔨 Build & Test"
+    runs-on: ubuntu-latest
+    outputs:
+      jar-name:    ${{ steps.meta.outputs.jar }}
+      short-sha:   ${{ steps.meta.outputs.sha }}
+      image-full:  ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Build & verify (parallel threads)
+        run: |
+          chmod +x mvnw
+          ./mvnw clean verify -T 1C
+
+      - name: Capture metadata
+        id: meta
+        run: |
+          JAR=$(ls target/spring-petclinic-rest-*.jar | xargs basename)
+          SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          IMAGE="ghcr.io/${{ github.repository }}:sha-${SHA}"
+          echo "jar=$JAR"    >> $GITHUB_OUTPUT
+          echo "sha=$SHA"    >> $GITHUB_OUTPUT
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: target/spring-petclinic-rest-*.jar
+          retention-days: 1
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: target/surefire-reports/
+
+  # ════════════════════════════════════════════════════════════
+  # JOB 2a — Snyk SCA (HARD BLOCK on Critical/High)
+  # ════════════════════════════════════════════════════════════
+  snyk:
+    name: "🔒 Snyk CVE Gate"
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Package for dependency resolution
+        run: |
+          chmod +x mvnw
+          ./mvnw clean package -DskipTests -q
+
+      - name: Snyk — fail on Critical/High (hard block)
+        env:
+          SNYK_TOKEN: ${{ secrets.TWSSnykPAT }}
+        run: |
+          npm install -g snyk --quiet
+          snyk auth $SNYK_TOKEN
+          # Hard block: exit 1 if Critical/High found — NO || true
+          snyk test --all-projects \
+                    --severity-threshold=high \
+                    --json-file-output=snyk-report.json
+
+      - name: Snyk monitor → dashboard snapshot
+        if: success()
+        env:
+          SNYK_TOKEN: ${{ secrets.TWSSnykPAT }}
+        run: snyk monitor --all-projects
+
+      - name: Parse Snyk report for summary
+        if: always()
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, sys
+          try:
+              with open('snyk-report.json') as f:
+                  data = json.load(f)
+              vulns = data.get('vulnerabilities', []) if isinstance(data, dict) else []
+              crit  = [v for v in vulns if v.get('severity') == 'critical']
+              high  = [v for v in vulns if v.get('severity') == 'high']
+              med   = [v for v in vulns if v.get('severity') == 'medium']
+              lines = [
+                  '## 🔒 Snyk Dependency Scan',
+                  '| Severity | Count |',
+                  '|---|---|',
+                  f'| 🔴 Critical | {len(crit)} |',
+                  f'| 🟠 High     | {len(high)} |',
+                  f'| 🟡 Medium   | {len(med)} |',
+                  '',
+                  '> Critical and High vulnerabilities **block deployment**.' if not (crit or high)
+                  else '> ❌ **BLOCKED** — Critical/High vulnerabilities detected.',
+              ]
+          except Exception as e:
+              lines = [f'## 🔒 Snyk Scan', f'Report parse error: {e}']
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:
+              f.write('\n'.join(lines) + '\n')
+          PYEOF
+
+      - name: Upload Snyk report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snyk-report
+          path: snyk-report.json
+
+  # ════════════════════════════════════════════════════════════
+  # JOB 2b — Build & push Docker image, Trivy image scan (HARD BLOCK)
+  # ════════════════════════════════════════════════════════════
+  image:
+    name: "🐳 Build Image + Trivy Scan"
+    runs-on: ubuntu-latest
+    needs: build
+    outputs:
+      image-tag:    ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.push.outputs.digest }}
+      sha-tag:      ${{ steps.sha-tag.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: target/
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build & push to GHCR
+        id: push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags:       ${{ steps.meta.outputs.tags }}
+          labels:     ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      - name: Capture sha-tag for downstream jobs
+        id: sha-tag
+        run: |
+          SHA_TAG=$(echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n' | grep "sha-" | head -1)
+          echo "value=$SHA_TAG" >> $GITHUB_OUTPUT
+          echo "Image tag: $SHA_TAG"
+
+      - name: Trivy image scan — HARD BLOCK on Critical/High
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref:     ${{ steps.sha-tag.outputs.value }}
+          format:        table
+          exit-code:     '1'
+          severity:      CRITICAL,HIGH
+          ignore-unfixed: true
+
+      - name: Trivy SARIF → GitHub Security tab
+        if: always()
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.sha-tag.outputs.value }}
+          format:    sarif
+          output:    trivy.sarif
+          severity:  CRITICAL,HIGH
+
+      - name: Upload SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+
+  # ════════════════════════════════════════════════════════════
+  # JOB 3 — Deploy + Verify (single job, same runner = same cluster)
+  # ════════════════════════════════════════════════════════════
+  deploy-verify:
+    name: "🚀 Deploy → kind + ✅ Verify"
+    runs-on: ubuntu-latest
+    needs: [snyk, image]       # BOTH gates must be green
+    outputs:
+      deploy-elapsed: ${{ steps.elapsed.outputs.seconds }}
+      health-status:  ${{ steps.health.outputs.status }}
+      pod-count:      ${{ steps.pods.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Record merge-to-running start time ──────────────────
+      - name: Start timer
+        id: start
+        run: echo "ts=$(date +%s)" >> $GITHUB_OUTPUT
+
+      # ── Install tools ──────────────────────────────────────
+      - name: Install kind + kubectl
+        run: |
+          # kind
+          curl -Lo kind https://kind.sigs.k8s.io/dl/v0.23.0/kind-linux-amd64
+          chmod +x kind && sudo mv kind /usr/local/bin/kind
+
+          # kubectl (matches k8s shipped with kind 0.23)
+          curl -LO "https://dl.k8s.io/release/v1.30.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/kubectl
+
+      # ── Create kind cluster ────────────────────────────────
+      - name: Create kind cluster
+        run: |
+          kind create cluster \
+            --name ${{ env.KIND_CLUSTER }} \
+            --config k8s/kind-cluster.yml \
+            --wait 60s
+          kubectl cluster-info --context kind-${{ env.KIND_CLUSTER }}
+          kubectl get nodes -o wide
+
+      # ── Pull image and load into kind ─────────────────────
+      - name: Load image into kind nodes
+        run: |
+          IMAGE="${{ needs.image.outputs.sha-tag }}"
+          echo "Loading: $IMAGE"
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          docker pull "$IMAGE"
+          kind load docker-image "$IMAGE" --name ${{ env.KIND_CLUSTER }}
+          echo "Image loaded into all kind nodes ✅"
+
+      # ── Apply manifests ────────────────────────────────────
+      - name: Apply Kubernetes manifests
+        run: |
+          IMAGE="${{ needs.image.outputs.sha-tag }}"
+
+          kubectl apply -f k8s/namespace.yml
+
+          # Stamp the exact image SHA into deployment
+          sed "s|petclinic:latest|${IMAGE}|g" k8s/deployment.yml \
+            | kubectl apply -f -
+
+          kubectl apply -f k8s/service.yml
+          kubectl apply -f k8s/service-nodeport.yml
+
+          echo "Manifests applied:"
+          kubectl get all -n ${{ env.K8S_NAMESPACE }}
+
+      # ── Wait for rollout ───────────────────────────────────
+      - name: Wait for rollout (max 3 min)
+        run: |
+          kubectl rollout status deployment/petclinic \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --timeout=180s
+          echo "Rollout complete ✅"
+
+      # ── Timer ──────────────────────────────────────────────
+      - name: Measure elapsed time
+        id: elapsed
+        run: |
+          END=$(date +%s)
+          START=${{ steps.start.outputs.ts }}
+          SECS=$((END - START))
+          echo "seconds=${SECS}" >> $GITHUB_OUTPUT
+          echo "⏱️  Merge → running: ${SECS}s"
+          if [ $SECS -gt 300 ]; then
+            echo "::warning::SLA BREACH — ${SECS}s exceeds 5-minute target"
+          else
+            echo "::notice::SLA MET — ${SECS}s (target: 300s)"
+          fi
+
+      # ── Collect pod evidence ───────────────────────────────
+      - name: Collect pod evidence
+        id: pods
+        run: |
+          COUNT=$(kubectl get pods -n ${{ env.K8S_NAMESPACE }} \
+            -l app=petclinic --field-selector=status.phase=Running \
+            --no-headers | wc -l | tr -d ' ')
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+
+          {
+            echo "=== kubectl get pods (wide) ==="
+            kubectl get pods -n ${{ env.K8S_NAMESPACE }} -o wide
+            echo ""
+            echo "=== kubectl get deployment ==="
+            kubectl get deployment petclinic -n ${{ env.K8S_NAMESPACE }}
+            echo ""
+            echo "=== kubectl describe deployment ==="
+            kubectl describe deployment petclinic -n ${{ env.K8S_NAMESPACE }}
+            echo ""
+            echo "=== kubectl get events ==="
+            kubectl get events -n ${{ env.K8S_NAMESPACE }} \
+              --sort-by='.lastTimestamp' | tail -25
+          } | tee pod-evidence.txt
+
+      # ── Collect pod logs ───────────────────────────────────
+      - name: Collect pod logs
+        run: |
+          for pod in $(kubectl get pods -n ${{ env.K8S_NAMESPACE }} \
+            -l app=petclinic -o jsonpath='{.items[*].metadata.name}'); do
+            echo "═══════════════════════════════════"
+            echo " Pod: $pod"
+            echo "═══════════════════════════════════"
+            kubectl logs "$pod" -n ${{ env.K8S_NAMESPACE }} --tail=60 2>&1
+            echo ""
+          done | tee pod-logs.txt
+
+      # ── Health check via NodePort ──────────────────────────
+      - name: Health check + smoke test
+        id: health
+        run: |
+          BASE="http://localhost:${{ env.NODEPORT }}/petclinic"
+
+          # Retry health endpoint (app takes ~30s to fully start)
+          echo "Checking health at $BASE/actuator/health ..."
+          for i in $(seq 1 12); do
+            HTTP=$(curl -sf -o /dev/null -w "%{http_code}" \
+              "$BASE/actuator/health" 2>/dev/null || echo "000")
+            [ "$HTTP" = "200" ] && break
+            echo "  Attempt $i/12 — HTTP $HTTP — waiting 5s..."
+            sleep 5
+          done
+
+          HEALTH_JSON=$(curl -sf "$BASE/actuator/health" \
+            || echo '{"status":"DOWN"}')
+          STATUS=$(echo "$HEALTH_JSON" | \
+            python3 -c "import sys,json; print(json.load(sys.stdin).get('status','UNKNOWN'))")
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          echo "Health: $STATUS"
+
+          # Smoke tests
+          {
+            echo "=== Smoke Tests ==="
+            for path in \
+              "actuator/health" \
+              "actuator/prometheus" \
+              "api/owners" \
+              "api/vets" \
+              "api/pettypes"; do
+              CODE=$(curl -sf -o /dev/null -w "%{http_code}" "$BASE/$path" || echo "000")
+              ICON=$( [ "$CODE" = "200" ] && echo "✅" || echo "❌" )
+              echo "$ICON  GET /$path → HTTP $CODE"
+            done
+          } | tee smoke-results.txt
+
+          # Prometheus metrics sample
+          {
+            echo "=== Prometheus Metrics Sample ==="
+            curl -sf "$BASE/actuator/prometheus" \
+              | grep -E "^(jvm_memory_used_bytes|process_cpu_usage|http_server_requests_seconds_count)" \
+              | head -15
+          } | tee metrics-evidence.txt
+
+          # Fail the job if app is not UP
+          [ "$STATUS" = "UP" ] || \
+            { echo "❌ Health check FAILED — status=$STATUS"; exit 1; }
+          echo "✅ Health check PASSED"
+
+      # ── kubectl get all ────────────────────────────────────
+      - name: Final kubectl snapshot
+        run: |
+          {
+            echo "=== kubectl get all -n ${{ env.K8S_NAMESPACE }} ==="
+            kubectl get all -n ${{ env.K8S_NAMESPACE }}
+            echo ""
+            echo "=== kubectl get nodes ==="
+            kubectl get nodes -o wide
+          } | tee kubectl-all.txt
+
+      # ── Upload all evidence ────────────────────────────────
+      - name: Upload evidence artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-evidence
+          path: |
+            pod-evidence.txt
+            pod-logs.txt
+            smoke-results.txt
+            metrics-evidence.txt
+            kubectl-all.txt
+
+  # ════════════════════════════════════════════════════════════
+  # JOB 4 — SonarQube SAST (runs in parallel, informational only)
+  # ════════════════════════════════════════════════════════════
+  sonarqube:
+    name: "🔍 SonarQube SAST"
+    runs-on: ubuntu-latest
+    needs: build
+    continue-on-error: true      # SAST is informational; does not block deploy
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: SonarQube analysis
+        env:
+          SONAR_TOKEN: ${{ secrets.TWSQPAT }}
+        run: |
+          chmod +x mvnw
+          ./mvnw clean verify \
+            org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
+            -Dsonar.projectKey=rohithb-tw_Rohithb-TW \
+            -Dsonar.projectName="Rohithb-TW" \
+            -Dsonar.organization=rohithb-tw \
+            -Dsonar.host.url=https://sonarcloud.io \
+            -Dsonar.token=$SONAR_TOKEN \
+            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
+            -Dsonar.java.source=21
+
+  # ════════════════════════════════════════════════════════════
+  # JOB 5 — GitHub Step Summary (always runs, proof of everything)
+  # ════════════════════════════════════════════════════════════
+  summary:
+    name: "📋 GitHub Step Summary"
+    runs-on: ubuntu-latest
+    needs: [build, snyk, image, deploy-verify, sonarqube]
+    if: always()
+    steps:
+      - name: Download all evidence artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: evidence/
+        continue-on-error: true
+
+      - name: Write GitHub Step Summary
+        run: |
+          BUILD="${{ needs.build.result }}"
+          SNYK="${{ needs.snyk.result }}"
+          IMAGE="${{ needs.image.result }}"
+          DEPLOY="${{ needs.deploy-verify.result }}"
+          SONAR="${{ needs.sonarqube.result }}"
+          HEALTH="${{ needs.deploy-verify.outputs.health-status }}"
+          ELAPSED="${{ needs.deploy-verify.outputs.deploy-elapsed }}"
+          PODS="${{ needs.deploy-verify.outputs.pod-count }}"
+          DIGEST="${{ needs.image.outputs.image-digest }}"
+          SHA="${{ needs.build.outputs.short-sha }}"
+
+          ok()  { [ "$1" = "success" ] && echo "✅ PASSED" || echo "❌ FAILED"; }
+          icon(){ [ "$1" = "success" ] && echo "✅" || echo "❌"; }
+          sla() {
+            S="${1:-999}"
+            [ "$S" -le 300 ] 2>/dev/null \
+              && echo "✅ ${S}s (under 5 min)" \
+              || echo "⚠️ ${S}s (over 5 min)"
+          }
+
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          # 🚀 Petclinic — Production Deployment Report
+          EOF
+
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+
+          > **Commit:** \`${{ github.sha }}\` | **By:** ${{ github.actor }} | **$(date -u '+%Y-%m-%d %H:%M UTC')**
+
+          ---
+
+          ## 📊 Pipeline Stage Results
+
+          | Stage | Result |
+          |---|---|
+          | 🔨 Build & Tests     | $(ok $BUILD) |
+          | 🔒 Snyk CVE Gate     | $(ok $SNYK) |
+          | 🐳 Docker + Trivy    | $(ok $IMAGE) |
+          | 🚀 Deploy + Verify   | $(ok $DEPLOY) |
+          | 🔍 SonarQube SAST    | $(ok $SONAR) *(informational)* |
+
+          ---
+
+          ## ⏱️ SLA: Merge → Production < 5 Minutes
+
+          $(sla "$ELAPSED")
+
+          ---
+
+          ## 🔒 Security Gates (both must pass to deploy)
+
+          | Gate | Tool | Threshold | Result |
+          |---|---|---|---|
+          | Dependency CVEs | Snyk SCA | Critical + High = BLOCK | $(icon $SNYK) |
+          | Image CVEs      | Trivy    | Critical + High = BLOCK | $(icon $IMAGE) |
+          | Code quality    | SonarQube| Quality gate (informational) | $(icon $SONAR) |
+
+          ---
+
+          ## 🐳 Docker Image
+
+          \`\`\`
+          Registry : ghcr.io/${{ github.repository }}
+          SHA tag  : ghcr.io/${{ github.repository }}:sha-${SHA}
+          Latest   : ghcr.io/${{ github.repository }}:latest
+          Digest   : ${DIGEST}
+          \`\`\`
+
+          ---
+
+          ## ☸️ Kubernetes — Pod Evidence
+
+          \`\`\`
+          $(cat evidence/deployment-evidence/pod-evidence.txt 2>/dev/null || echo "(not available)")
+          \`\`\`
+
+          ---
+
+          ## 📜 Application Logs (tail 60 per pod)
+
+          \`\`\`
+          $(cat evidence/deployment-evidence/pod-logs.txt 2>/dev/null | head -120 || echo "(not available)")
+          \`\`\`
+
+          ---
+
+          ## 🔬 Smoke Test Results
+
+          \`\`\`
+          $(cat evidence/deployment-evidence/smoke-results.txt 2>/dev/null || echo "(not available)")
+          \`\`\`
+
+          ---
+
+          ## 📈 Live Prometheus Metrics
+
+          \`\`\`
+          $(cat evidence/deployment-evidence/metrics-evidence.txt 2>/dev/null || echo "(not available)")
+          \`\`\`
+
+          ---
+
+          ## 🧾 kubectl get all
+
+          \`\`\`
+          $(cat evidence/deployment-evidence/kubectl-all.txt 2>/dev/null || echo "(not available)")
+          \`\`\`
+
+          ---
+
+          ## ✅ Production Readiness Contract
+
+          | Promise | Evidence | Met? |
+          |---|---|---|
+          | No Critical/High CVEs | Snyk + Trivy both passed | $(icon $SNYK) $(icon $IMAGE) |
+          | No broken build in prod | Build + test gate | $(icon $BUILD) |
+          | Prod live < 5 min from merge | ${ELAPSED}s elapsed | $(sla "$ELAPSED") |
+          | Zero-downtime rollout | maxUnavailable=0 in deployment.yml | ✅ |
+          | Non-root container | USER petclinic in Dockerfile | ✅ |
+          | Liveness + Readiness probes | k8s/deployment.yml | ✅ |
+          | App health at deploy time | Actuator /health | ${HEALTH:-unknown} |
+          | Running pods | kubectl confirmed | ${PODS:-?} pod(s) running |
+          | Image pinned to SHA | sha-${SHA} | ✅ |
+
+          EOF

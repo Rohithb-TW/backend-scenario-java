@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: petclinic
+  namespace: petclinic
+  labels:
+    app: petclinic
+    version: "latest"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: petclinic
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0          # zero-downtime: always keep 2 pods running
+  template:
+    metadata:
+      labels:
+        app: petclinic
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path:   "/petclinic/actuator/prometheus"
+        prometheus.io/port:   "9966"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: petclinic
+          image: petclinic:latest          # replaced by CI with ghcr.io/<org>/<repo>:<sha>
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 9966
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              value: "h2,spring-data-jpa"
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          readinessProbe:
+            httpGet:
+              path: /petclinic/actuator/health/readiness
+              port: 9966
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /petclinic/actuator/health/liveness
+              port: 9966
+            initialDelaySeconds: 45
+            periodSeconds: 15
+            failureThreshold: 3
+      terminationGracePeriodSeconds: 30

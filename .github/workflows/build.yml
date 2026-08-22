@@ -1,149 +1,478 @@
-name: Build
+name: "M03 — CI/CD Pipeline (<=5 min to prod)"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Triggers
+#   push to main/master  →  full pipeline: build → security gates → deploy
+#   pull_request         →  handled exclusively by pr.yml
+#
+# Pipeline timing target (GHA ubuntu-latest):
+#   Phase 1  build-test      ~90 s   (Maven cache hit + -T 1C)
+#   Phase 2  snyk-gate       ~60 s   (parallel with trivy-gate)
+#   Phase 2  trivy-gate      ~75 s   (parallel with snyk-gate)
+#   Phase 4  deploy          ~90 s   (kind cluster + load + rollout)
+#   ────────────────────────────────
+#   Total wall-clock         ~5 min  (phases 2 & 3 overlap with kind setup)
+# ─────────────────────────────────────────────────────────────────────────────
 on:
   push:
-    branches:
-      - main
-      - master
-  pull_request:
+    branches: [main, master]
 
+# Cancel any in-progress deploy for the same branch to avoid queued races.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: petclinic
+  IMAGE_TAG: ${{ github.sha }}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE 1 — Build, test, and package  (target: ~90 s)
+# ═════════════════════════════════════════════════════════════════════════════
 jobs:
-  # ──────────────────────────────────────────────
-  # Job 1: Compile, test, and verify the project
-  # ──────────────────────────────────────────────
-  build:
-    name: Build & Test
+
+  build-test:
+    name: "Build & Test"
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout source code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
           cache: maven
 
-      - name: Make Maven wrapper executable
-        run: chmod +x mvnw
+      - name: Build and verify
+        run: |
+          chmod +x mvnw
+          ./mvnw clean verify -T 1C -q
 
-      - name: Build and verify with Maven
-        run: ./mvnw clean verify
+      - name: Publish test summary
+        if: always()
+        run: python3 .github/scripts/test_summary.py
 
-      # Cache the local Maven repository so parallel jobs can reuse it
-      - name: Cache Maven local repository
-        uses: actions/cache@v4
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          path: ~/.m2/repository
-          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            maven-${{ runner.os }}-
+          name: test-results-${{ github.sha }}
+          path: target/surefire-reports/
+          retention-days: 7
 
-  # ──────────────────────────────────────────────
-  # Job 2: SonarQube static analysis (SAST + quality gates)
-  # Runs in parallel with Snyk after build succeeds
-  # Requires: SONAR_TOKEN secret in GitHub repository settings
-  # ──────────────────────────────────────────────
-  sonarqube:
-    name: SonarQube Analysis
+      - name: Upload JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar-${{ github.sha }}
+          path: target/spring-petclinic-rest-*.jar
+          retention-days: 1
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE 2 — Security gates (parallel; BOTH must pass before deploy)
+#   2a  Snyk SCA        — dependency CVEs
+#   2b  Trivy image     — OS + library CVEs in the Docker image
+# ═════════════════════════════════════════════════════════════════════════════
+
+  # ── 2a: Snyk SCA ────────────────────────────────────────────────────────────
+  snyk-gate:
+    name: "Snyk SCA Gate"
     runs-on: ubuntu-latest
-    needs: build
+    needs: build-test
 
     steps:
-      - name: Checkout source code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
         with:
-          # Fetch full history for accurate blame/coverage data
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-jar-${{ github.sha }}
+          path: target/
+
+      - name: Install Snyk CLI
+        run: npm install -g snyk --silent
+
+      - name: Snyk test — fail on Critical/High
+        env:
+          SNYK_TOKEN: ${{ secrets.TWSSnykPAT }}
+        run: |
+          snyk auth "$SNYK_TOKEN"
+          set +e
+          snyk test --all-projects --severity-threshold=high 
+            --json-file-output=snyk-report.json
+          SNYK_RC=$?
+          set -e
+          python3 .github/scripts/snyk_summary.py snyk-report.json "${{ github.sha }}" "$SNYK_RC"
+
+      - name: Upload Snyk report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snyk-report-${{ github.sha }}
+          path: snyk-report.json
+
+      - name: Snyk monitor (upload snapshot to dashboard)
+        env:
+          SNYK_TOKEN: ${{ secrets.TWSSnykPAT }}
+        run: snyk monitor --all-projects
+
+  # ── 2b: Docker build + Trivy image scan ─────────────────────────────────────
+  trivy-gate:
+    name: "Docker Build + Trivy Image Gate"
+    runs-on: ubuntu-latest
+    needs: build-test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-jar-${{ github.sha }}
+          path: target/
+
+      - name: Build Docker image
+        run: |
+          docker build 
+            --tag ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} 
+            --label "git.sha=${{ github.sha }}" 
+            --label "git.ref=${{ github.ref_name }}" 
+            --label "build.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" 
+            .
+
+      - name: Trivy — fail on Critical/High (hard gate)
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          format: table
+          exit-code: '1'
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+      - name: Trivy — SARIF upload (GitHub Security tab)
+        if: always()
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          format: sarif
+          output: trivy.sarif
+          severity: CRITICAL,HIGH
+
+      - name: Upload SARIF to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+
+      - name: Trivy — JSON for summary
+        if: always()
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          format: json
+          output: trivy.json
+          severity: CRITICAL,HIGH
+
+      - name: Publish Trivy summary
+        if: always()
+        run: python3 .github/scripts/trivy_summary.py trivy.json "${{ github.sha }}"
+
+      # Export the already-scanned image so the deploy job reuses it
+      # without rebuilding (saves ~60 s on the critical path).
+      - name: Export image tar
+        if: success()
+        run: docker save ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} | gzip > image.tar.gz
+
+      - name: Upload image tar
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-${{ github.sha }}
+          path: image.tar.gz
+          retention-days: 1
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE 3 — SonarQube SAST (advisory — runs parallel to Phase 2)
+#            Set continue-on-error: false to make it a hard gate.
+# ═════════════════════════════════════════════════════════════════════════════
+  sonarqube:
+    name: "SonarQube SAST"
+    runs-on: ubuntu-latest
+    needs: build-test
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
           fetch-depth: 0
 
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
           cache: maven
-
-      - name: Restore Maven local repository cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.m2/repository
-          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            maven-${{ runner.os }}-
-
-      - name: Make Maven wrapper executable
-        run: chmod +x mvnw
 
       - name: Run SonarQube analysis
         env:
           SONAR_TOKEN: ${{ secrets.TWSQPAT }}
         run: |
-          ./mvnw clean verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
-            -Dsonar.projectKey=rohithb-tw_Rohithb-TW \
-            -Dsonar.projectName="Rohithb-TW" \
-            -Dsonar.organization=rohithb-tw \
-            -Dsonar.host.url=https://sonarcloud.io \
-            -Dsonar.token=$SONAR_TOKEN \
-            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
-            -Dsonar.java.source=21
+          chmod +x mvnw
+          ./mvnw clean verify org.sonarsource.scanner.maven:sonar-maven-plugin:sonar 
+            -Dsonar.projectKey=rohithb-tw_Rohithb-TW 
+            -Dsonar.projectName="Rohithb-TW" 
+            -Dsonar.organization=rohithb-tw 
+            -Dsonar.host.url=https://sonarcloud.io 
+            -Dsonar.token=$SONAR_TOKEN 
+            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml 
+            -Dsonar.java.source=21 -q
 
-  # ──────────────────────────────────────────────
-  # Job 3: Snyk security scan (SCA + dependency vulnerabilities)
-  # Runs in parallel with SonarQube after build succeeds
-  # Requires: SNYK_TOKEN secret in GitHub repository settings
-  # ──────────────────────────────────────────────
-  snyk:
-    name: Snyk Security Scan
+      - name: SonarQube summary
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          EMOJI="$([ "$STATUS" = "success" ] && echo "OK" || echo "WARNING")"
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          ## SonarQube SAST (advisory)
+          | Result | ${STATUS} |
+          |---|---|
+          | Dashboard | [SonarCloud](https://sonarcloud.io/project/overview?id=rohithb-tw_Rohithb-TW) |
+          EOF
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE 4 — Deploy to kind cluster  (target: start ~t+3 min, done ~t+5 min)
+#            Only runs when BOTH security gates pass.
+# ═════════════════════════════════════════════════════════════════════════════
+  deploy:
+    name: "Deploy to kind (production)"
     runs-on: ubuntu-latest
-    needs: build
+    needs: [snyk-gate, trivy-gate]
+    environment:
+      name: production
+      url: http://localhost:30080/petclinic/actuator/health
 
     steps:
-      - name: Checkout source code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
+      - name: Download pre-scanned Docker image
+        uses: actions/download-artifact@v4
         with:
-          distribution: temurin
-          java-version: '21'
-          cache: maven
+          name: docker-image-${{ github.sha }}
 
-      - name: Restore Maven local repository cache
-        uses: actions/cache@v4
+      # ── Provision kind cluster ───────────────────────────────────────────
+      - name: Install kind
+        run: |
+          curl -sLo /usr/local/bin/kind 
+            "https://kind.sigs.k8s.io/dl/v0.23.0/kind-linux-amd64"
+          chmod +x /usr/local/bin/kind
+
+      - name: Create kind cluster
+        run: |
+          kind create cluster 
+            --config k8s/kind-cluster.yml 
+            --wait 60s
+          kubectl cluster-info --context kind-petclinic-prod
+
+      # ── Load image (no external registry needed) ─────────────────────────
+      - name: Load image into kind nodes
+        run: |
+          docker load < image.tar.gz
+          kind load docker-image 
+            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} 
+            --name petclinic-prod
+
+      # ── Stamp exact SHA into the manifest ────────────────────────────────
+      - name: Patch image tag in deployment manifest
+        run: |
+          sed -i 
+            "s|image: petclinic:.*|image: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}|g" 
+            k8s/deployment.yml
+
+      # ── Apply manifests ───────────────────────────────────────────────────
+      - name: Apply Kubernetes manifests
+        run: |
+          kubectl apply -f k8s/namespace.yml
+          kubectl apply -f k8s/deployment.yml
+          kubectl apply -f k8s/service.yml
+          kubectl apply -f k8s/service-nodeport.yml
+
+      # ── Wait for rollout ──────────────────────────────────────────────────
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/petclinic 
+            --namespace petclinic 
+            --timeout=120s
+
+      # ── Smoke test ────────────────────────────────────────────────────────
+      - name: Smoke test — health endpoint
+        id: smoke
+        run: |
+          echo "Waiting for app to become ready..."
+          for i in $(seq 1 18); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" 
+              http://localhost:30080/petclinic/actuator/health 2>/dev/null || echo "000")
+            echo "  attempt $i — HTTP ${CODE}"
+            if [ "${CODE}" = "200" ]; then
+              echo "healthy=true" >> "$GITHUB_OUTPUT"
+              echo "App is healthy (HTTP 200)"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "healthy=false" >> "$GITHUB_OUTPUT"
+          echo "App did not become healthy within 180 s"
+          exit 1
+
+      # ── Collect all kubectl evidence ──────────────────────────────────────
+      - name: Collect kubectl evidence
+        if: always()
+        run: |
+          NS=petclinic
+          mkdir -p /tmp/evidence
+
+          kubectl get pods -n ${NS} -o wide                             > /tmp/evidence/pods.txt     2>&1
+          kubectl get deployments -n ${NS} -o wide                     > /tmp/evidence/deployments.txt 2>&1
+          kubectl get svc -n ${NS}                                     > /tmp/evidence/services.txt  2>&1
+          kubectl describe deployment/petclinic -n ${NS}               > /tmp/evidence/describe.txt  2>&1
+          kubectl get events -n ${NS} --sort-by='.lastTimestamp'       > /tmp/evidence/events.txt    2>&1
+          kubectl top pods -n ${NS} 2>/dev/null                        > /tmp/evidence/top.txt       
+            || echo "(metrics-server not installed)"                  >> /tmp/evidence/top.txt
+
+          # Per-pod logs
+          for POD in $(kubectl get pods -n ${NS} -o name 2>/dev/null); do
+            echo "=== ${POD} ===" >> /tmp/evidence/pod-logs.txt
+            kubectl logs "${POD}" -n ${NS} --tail=50 >> /tmp/evidence/pod-logs.txt 2>&1
+          done
+
+          # Health endpoint body
+          curl -s http://localhost:30080/petclinic/actuator/health 
+            > /tmp/evidence/health.json 2>/dev/null 
+            || echo '{"status":"unreachable"}' > /tmp/evidence/health.json
+
+      - name: Upload kubectl evidence
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          path: ~/.m2/repository
-          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
-          restore-keys: |
-            maven-${{ runner.os }}-
+          name: kubectl-evidence-${{ github.sha }}
+          path: /tmp/evidence/
+          retention-days: 7
 
-      - name: Make Maven wrapper executable
-        run: chmod +x mvnw
+      # ── Write the GitHub Step Summary (full proof of deployment) ──────────
+      - name: Write deployment summary
+        if: always()
+        run: |
+          NS=petclinic
+          DEPLOY_TIME="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          HEALTHY="${{ steps.smoke.outputs.healthy }}"
+          HEALTH_STATUS="$([ "$HEALTHY" = "true" ] && echo "PASSING" || echo "FAILING")"
+          HEALTH_BODY="$(cat /tmp/evidence/health.json 2>/dev/null || echo 'unreachable')"
+          POD_TABLE="$(cat /tmp/evidence/pods.txt 2>/dev/null)"
+          DEPLOY_TABLE="$(cat /tmp/evidence/deployments.txt 2>/dev/null)"
+          SVC_TABLE="$(cat /tmp/evidence/services.txt 2>/dev/null)"
+          EVENTS="$(tail -20 /tmp/evidence/events.txt 2>/dev/null)"
+          POD_LOGS="$(cat /tmp/evidence/pod-logs.txt 2>/dev/null)"
 
-      - name: Build project (needed for Snyk dependency resolution)
-        run: ./mvnw clean package -DskipTests
+          {
+            echo ""
+            echo "---"
+            echo ""
+            echo "# Production Deployment — kind Cluster"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Deploy time  | `${DEPLOY_TIME}` |"
+            echo "| Image        | `${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}` |"
+            echo "| Git SHA      | `${{ github.sha }}` |"
+            echo "| Branch       | `${{ github.ref_name }}` |"
+            echo "| Triggered by | @${{ github.actor }} |"
+            echo "| Health check | ${HEALTH_STATUS} |"
+            echo ""
+            echo "## Pod Status"
+            echo '```'
+            echo "${POD_TABLE}"
+            echo '```'
+            echo ""
+            echo "## Deployment"
+            echo '```'
+            echo "${DEPLOY_TABLE}"
+            echo '```'
+            echo ""
+            echo "## Services"
+            echo '```'
+            echo "${SVC_TABLE}"
+            echo '```'
+            echo ""
+            echo "## Health Endpoint Response"
+            echo '```json'
+            echo "${HEALTH_BODY}"
+            echo '```'
+            echo ""
+            echo "## Recent Events"
+            echo '```'
+            echo "${EVENTS}"
+            echo '```'
+            echo ""
+            echo "## Pod Logs (last 50 lines)"
+            echo '```'
+            echo "${POD_LOGS}"
+            echo '```'
+            echo ""
+            echo "> Security promise kept: Snyk SCA and Trivy image gates passed."
+            echo "> No Critical or High CVE was permitted through to production."
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Install Snyk CLI
-        run: npm install -g snyk
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE 5 — Aggregate pipeline summary (always runs)
+# ═════════════════════════════════════════════════════════════════════════════
+  pipeline-summary:
+    name: "Pipeline Summary"
+    runs-on: ubuntu-latest
+    needs: [build-test, snyk-gate, trivy-gate, sonarqube, deploy]
+    if: always()
 
-      - name: Authenticate Snyk
-        env:
-          SNYK_TOKEN: ${{ secrets.TWSSnykPAT }}
-        run: snyk auth $SNYK_TOKEN
+    steps:
+      - name: Write pipeline summary
+        run: |
+          BUILD="${{ needs.build-test.result }}"
+          SNYK="${{ needs.snyk-gate.result }}"
+          TRIVY="${{ needs.trivy-gate.result }}"
+          SONAR="${{ needs.sonarqube.result }}"
+          DEPLOY="${{ needs.deploy.result }}"
 
-      - name: Run Snyk dependency vulnerability test
-        env:
-          SNYK_TOKEN: ${{ secrets.TWSSnykPAT }}
-        # --all-projects scans all Maven modules
-        # --severity-threshold=high  → fail only on high/critical vulns
-        # || true                    → don't fail the pipeline on found vulns (optional: remove to enforce)
-        run: snyk test --all-projects --severity-threshold=high || true
+          ok()  { [ "$1" = "success" ] && echo "OK"      || echo "FAILED"; }
+          skip(){ [ "$1" = "skipped" ] && echo "SKIPPED" || echo "$(ok "$1")"; }
 
-      - name: Monitor project with Snyk (uploads snapshot to Snyk dashboard)
-        env:
-          SNYK_TOKEN: ${{ secrets.TWSSnykPAT }}
-        # Only monitor on pushes to main/master (not on PRs) to avoid duplicate snapshots
-        # Note: --project-name is incompatible with --all-projects; Snyk auto-names from manifest
-        if: github.event_name == 'push'
-        run: snyk monitor --all-projects
+          OVERALL="ALL STAGES PASSED"
+          for r in "$BUILD" "$SNYK" "$TRIVY" "$DEPLOY"; do
+            [ "$r" != "success" ] && OVERALL="PIPELINE FAILED" && break
+          done
+
+          {
+            echo ""
+            echo "---"
+            echo ""
+            echo "# M03 Pipeline — Full Run Summary"
+            echo ""
+            echo "| Stage | Job | Result |"
+            echo "|---|---|---|"
+            echo "| Phase 1 | Build and Test      | $(ok $BUILD) |"
+            echo "| Phase 2 | Snyk SCA Gate       | $(ok $SNYK) |"
+            echo "| Phase 2 | Trivy Image Gate    | $(ok $TRIVY) |"
+            echo "| Phase 3 | SonarQube SAST      | $(skip $SONAR) (advisory) |"
+            echo "| Phase 4 | Deploy to kind      | $(skip $DEPLOY) |"
+            echo ""
+            echo "## ${OVERALL}"
+            echo ""
+            echo "| Field  | Value |"
+            echo "|---|---|"
+            echo "| Commit | `${{ github.sha }}` |"
+            echo "| Branch | `${{ github.ref_name }}` |"
+            echo "| Actor  | @${{ github.actor }} |"
+            echo "| Run    | ${{ github.run_number }} |"
+            echo ""
+            echo "> Security promise: No Critical or High CVE may reach production."
+            echo "> Both Snyk and Trivy gates are hard blockers."
+          } >> "$GITHUB_STEP_SUMMARY"

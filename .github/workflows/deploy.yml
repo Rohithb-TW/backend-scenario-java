@@ -53,10 +53,10 @@ jobs:
           java-version: '21'
           cache: maven
 
-      - name: Build & verify (parallel threads)
+      - name: Build & verify
         run: |
           chmod +x mvnw
-          ./mvnw clean verify -T 1C
+          ./mvnw clean verify
 
       - name: Capture metadata
         id: meta

@@ -40,11 +40,24 @@ spec:
               value: "h2,spring-data-jpa"
           resources:
             requests:
-              cpu: "250m"
+              cpu: "500m"
               memory: "512Mi"
             limits:
-              cpu: "1000m"
+              cpu: "2000m"
               memory: "1Gi"
+          lifecycle:
+            preStop:
+              exec:
+                # Allow 5s for the load balancer to drain in-flight connections
+                # before the container receives SIGTERM.
+                command: ["/bin/sh", "-c", "sleep 5"]
+          startupProbe:
+            httpGet:
+              path: /petclinic/actuator/health/readiness
+              port: 9966
+            # 15 attempts x 10s = 150s budget for slow cold starts
+            failureThreshold: 15
+            periodSeconds: 10
           readinessProbe:
             httpGet:
               path: /petclinic/actuator/health/readiness

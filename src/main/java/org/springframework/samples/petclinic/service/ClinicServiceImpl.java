@@ -15,6 +15,9 @@
  */
 package org.springframework.samples.petclinic.service;
 
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.cache.annotation.Caching;
 import org.springframework.dao.DataAccessException;
 import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.data.domain.Page;
@@ -33,6 +36,18 @@ import java.util.function.Supplier;
 /**
  * Mostly used as a facade for all Petclinic controllers
  * Also a placeholder for @Transactional and @Cacheable annotations
+ *
+ * <p>Caching strategy:
+ * <ul>
+ *   <li>{@code @Cacheable} is applied to collection-level reads ({@code findAll*},
+ *       {@code findPetTypes}, {@code findOwnerByLastName}, {@code findVisitsByPetId})
+ *       which are high-frequency and stable between writes.</li>
+ *   <li>Single-entity by-ID lookups are intentionally NOT cached to avoid
+ *       stale data after {@code @Transactional} test rollbacks.</li>
+ *   <li>{@code @CacheEvict(beforeInvocation = true)} is used on all write/delete
+ *       methods so that subsequent reads within the same transaction always
+ *       bypass the cache and fetch fresh data from the database.</li>
+ * </ul>
  *
  * @author Michael Isvy
  * @author Vitaliy Fedoriv
@@ -62,8 +77,13 @@ public class ClinicServiceImpl implements ClinicService {
         this.petTypeRepository = petTypeRepository;
     }
 
+    // -------------------------------------------------------------------------
+    // Pet methods
+    // -------------------------------------------------------------------------
+
     @Override
     @Transactional(readOnly = true)
+    @Cacheable("pets")
     public Collection<Pet> findAllPets() throws DataAccessException {
         return petRepository.findAll();
     }
@@ -75,10 +95,35 @@ public class ClinicServiceImpl implements ClinicService {
     }
 
     @Override
+    @Transactional(readOnly = true)
+    public Pet findPetById(int id) throws DataAccessException {
+        return findEntityById(() -> petRepository.findById(id));
+    }
+
+    @Override
     @Transactional
+    @Caching(evict = {
+        @CacheEvict(value = "pets", allEntries = true, beforeInvocation = true),
+        @CacheEvict(value = "owners", allEntries = true, beforeInvocation = true)
+    })
+    public void savePet(Pet pet) throws DataAccessException {
+        pet.setType(findPetTypeById(pet.getType().getId()));
+        petRepository.save(pet);
+    }
+
+    @Override
+    @Transactional
+    @Caching(evict = {
+        @CacheEvict(value = "pets", allEntries = true, beforeInvocation = true),
+        @CacheEvict(value = "owners", allEntries = true, beforeInvocation = true)
+    })
     public void deletePet(Pet pet) throws DataAccessException {
         petRepository.delete(pet);
     }
+
+    // -------------------------------------------------------------------------
+    // Visit methods
+    // -------------------------------------------------------------------------
 
     @Override
     @Transactional(readOnly = true)
@@ -88,15 +133,35 @@ public class ClinicServiceImpl implements ClinicService {
 
     @Override
     @Transactional(readOnly = true)
+    @Cacheable("visits")
     public Collection<Visit> findAllVisits() throws DataAccessException {
         return visitRepository.findAll();
     }
 
     @Override
+    @Transactional(readOnly = true)
+    @Cacheable(value = "visits", key = "'byPet_' + #petId")
+    public Collection<Visit> findVisitsByPetId(int petId) {
+        return visitRepository.findByPetId(petId);
+    }
+
+    @Override
     @Transactional
+    @CacheEvict(value = "visits", allEntries = true, beforeInvocation = true)
+    public void saveVisit(Visit visit) throws DataAccessException {
+        visitRepository.save(visit);
+    }
+
+    @Override
+    @Transactional
+    @CacheEvict(value = "visits", allEntries = true, beforeInvocation = true)
     public void deleteVisit(Visit visit) throws DataAccessException {
         visitRepository.delete(visit);
     }
+
+    // -------------------------------------------------------------------------
+    // Vet methods
+    // -------------------------------------------------------------------------
 
     @Override
     @Transactional(readOnly = true)
@@ -106,24 +171,39 @@ public class ClinicServiceImpl implements ClinicService {
 
     @Override
     @Transactional(readOnly = true)
+    @Cacheable("vets")
     public Collection<Vet> findAllVets() throws DataAccessException {
         return vetRepository.findAll();
     }
 
     @Override
+    @Transactional(readOnly = true)
+    @Cacheable("vets")
+    public Collection<Vet> findVets() throws DataAccessException {
+        return vetRepository.findAll();
+    }
+
+    @Override
     @Transactional
+    @CacheEvict(value = "vets", allEntries = true, beforeInvocation = true)
     public void saveVet(Vet vet) throws DataAccessException {
         vetRepository.save(vet);
     }
 
     @Override
     @Transactional
+    @CacheEvict(value = "vets", allEntries = true, beforeInvocation = true)
     public void deleteVet(Vet vet) throws DataAccessException {
         vetRepository.delete(vet);
     }
 
+    // -------------------------------------------------------------------------
+    // Owner methods
+    // -------------------------------------------------------------------------
+
     @Override
     @Transactional(readOnly = true)
+    @Cacheable("owners")
     public Collection<Owner> findAllOwners() throws DataAccessException {
         return ownerRepository.findAll();
     }
@@ -138,10 +218,35 @@ public class ClinicServiceImpl implements ClinicService {
     }
 
     @Override
+    @Transactional(readOnly = true)
+    public Owner findOwnerById(int id) throws DataAccessException {
+        return findEntityById(() -> ownerRepository.findById(id));
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    @Cacheable(value = "owners", key = "'byLastName_' + #lastName")
+    public Collection<Owner> findOwnerByLastName(String lastName) throws DataAccessException {
+        return ownerRepository.findByLastName(lastName);
+    }
+
+    @Override
     @Transactional
+    @CacheEvict(value = "owners", allEntries = true, beforeInvocation = true)
+    public void saveOwner(Owner owner) throws DataAccessException {
+        ownerRepository.save(owner);
+    }
+
+    @Override
+    @Transactional
+    @CacheEvict(value = "owners", allEntries = true, beforeInvocation = true)
     public void deleteOwner(Owner owner) throws DataAccessException {
         ownerRepository.delete(owner);
     }
+
+    // -------------------------------------------------------------------------
+    // PetType methods
+    // -------------------------------------------------------------------------
 
     @Override
     @Transactional(readOnly = true)
@@ -151,21 +256,35 @@ public class ClinicServiceImpl implements ClinicService {
 
     @Override
     @Transactional(readOnly = true)
+    @Cacheable("petTypes")
     public Collection<PetType> findAllPetTypes() throws DataAccessException {
         return petTypeRepository.findAll();
     }
 
     @Override
+    @Transactional(readOnly = true)
+    @Cacheable("petTypes")
+    public Collection<PetType> findPetTypes() throws DataAccessException {
+        return petRepository.findPetTypes();
+    }
+
+    @Override
     @Transactional
+    @CacheEvict(value = "petTypes", allEntries = true, beforeInvocation = true)
     public void savePetType(PetType petType) throws DataAccessException {
         petTypeRepository.save(petType);
     }
 
     @Override
     @Transactional
+    @CacheEvict(value = "petTypes", allEntries = true, beforeInvocation = true)
     public void deletePetType(PetType petType) throws DataAccessException {
         petTypeRepository.delete(petType);
     }
+
+    // -------------------------------------------------------------------------
+    // Specialty methods
+    // -------------------------------------------------------------------------
 
     @Override
     @Transactional(readOnly = true)
@@ -175,77 +294,9 @@ public class ClinicServiceImpl implements ClinicService {
 
     @Override
     @Transactional(readOnly = true)
+    @Cacheable("specialties")
     public Collection<Specialty> findAllSpecialties() throws DataAccessException {
         return specialtyRepository.findAll();
-    }
-
-    @Override
-    @Transactional
-    public void saveSpecialty(Specialty specialty) throws DataAccessException {
-        specialtyRepository.save(specialty);
-    }
-
-    @Override
-    @Transactional
-    public void deleteSpecialty(Specialty specialty) throws DataAccessException {
-        specialtyRepository.delete(specialty);
-    }
-
-    @Override
-    @Transactional(readOnly = true)
-    public Collection<PetType> findPetTypes() throws DataAccessException {
-        return petRepository.findPetTypes();
-    }
-
-    @Override
-    @Transactional(readOnly = true)
-    public Owner findOwnerById(int id) throws DataAccessException {
-        return findEntityById(() -> ownerRepository.findById(id));
-    }
-
-    @Override
-    @Transactional(readOnly = true)
-    public Pet findPetById(int id) throws DataAccessException {
-        return findEntityById(() -> petRepository.findById(id));
-    }
-
-    @Override
-    @Transactional
-    public void savePet(Pet pet) throws DataAccessException {
-        pet.setType(findPetTypeById(pet.getType().getId()));
-        petRepository.save(pet);
-    }
-
-    @Override
-    @Transactional
-    public void saveVisit(Visit visit) throws DataAccessException {
-        visitRepository.save(visit);
-
-    }
-
-    @Override
-    @Transactional(readOnly = true)
-    public Collection<Vet> findVets() throws DataAccessException {
-        return vetRepository.findAll();
-    }
-
-    @Override
-    @Transactional
-    public void saveOwner(Owner owner) throws DataAccessException {
-        ownerRepository.save(owner);
-
-    }
-
-    @Override
-    @Transactional(readOnly = true)
-    public Collection<Owner> findOwnerByLastName(String lastName) throws DataAccessException {
-        return ownerRepository.findByLastName(lastName);
-    }
-
-    @Override
-    @Transactional(readOnly = true)
-    public Collection<Visit> findVisitsByPetId(int petId) {
-        return visitRepository.findByPetId(petId);
     }
 
     @Override
@@ -253,6 +304,24 @@ public class ClinicServiceImpl implements ClinicService {
     public List<Specialty> findSpecialtiesByNameIn(Set<String> names) {
         return findEntityById(() -> specialtyRepository.findSpecialtiesByNameIn(names));
     }
+
+    @Override
+    @Transactional
+    @CacheEvict(value = "specialties", allEntries = true, beforeInvocation = true)
+    public void saveSpecialty(Specialty specialty) throws DataAccessException {
+        specialtyRepository.save(specialty);
+    }
+
+    @Override
+    @Transactional
+    @CacheEvict(value = "specialties", allEntries = true, beforeInvocation = true)
+    public void deleteSpecialty(Specialty specialty) throws DataAccessException {
+        specialtyRepository.delete(specialty);
+    }
+
+    // -------------------------------------------------------------------------
+    // Internal helpers
+    // -------------------------------------------------------------------------
 
     private <T> T findEntityById(Supplier<T> supplier) {
         try {

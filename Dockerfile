@@ -23,6 +23,10 @@ WORKDIR /app
 # Copy only the fat JAR from builder
 COPY --from=builder /app/target/spring-petclinic-rest-*.jar app.jar
 
+# JVM tuning: pre-allocate 50% of allowed heap at startup (reduces GC pause ramp-up),
+# exit immediately on OOM so Kubernetes can restart cleanly instead of hanging.
+ENV JAVA_TOOL_OPTIONS="-XX:InitialRAMPercentage=50.0 -XX:+ExitOnOutOfMemoryError"
+
 # Switch to non-root
 USER petclinic
 

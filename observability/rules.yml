@@ -1,0 +1,42 @@
+groups:
+  - name: petclinic_recording_rules
+    interval: 15s
+    rules:
+
+      # ── HTTP p99 latency ─────────────────────────────────────────────────
+      # Pre-compute p99 request latency per URI so dashboards query a single
+      # time-series instead of recomputing histograms on every render.
+      - record: job:http_server_requests_seconds:p99
+        expr: |
+          histogram_quantile(0.99,
+            sum by (job, uri, le) (
+              rate(http_server_requests_seconds_bucket{application="petclinic"}[2m])
+            )
+          )
+
+      # ── Caffeine cache hit-rate ──────────────────────────────────────────
+      # hit-rate = hits / (hits + misses) per cache name, 2-minute window.
+      # Returns NaN when a cache has never been accessed (safe for Grafana).
+      - record: job:cache_hit_rate:ratio2m
+        expr: |
+          sum by (cache, application) (
+            rate(cache_gets_total{result="hit", application="petclinic"}[2m])
+          )
+          /
+          (
+            sum by (cache, application) (
+              rate(cache_gets_total{result="hit", application="petclinic"}[2m])
+            )
+            +
+            sum by (cache, application) (
+              rate(cache_gets_total{result="miss", application="petclinic"}[2m])
+            )
+          )
+
+      # ── HikariCP pool utilisation ────────────────────────────────────────
+      # active / max connections — alert when consistently > 0.8.
+      - record: job:hikari_pool_utilisation:ratio
+        expr: |
+          hikaricp_connections_active{application="petclinic", pool="PetclinicPool"}
+          /
+          hikaricp_connections_max{application="petclinic", pool="PetclinicPool"}

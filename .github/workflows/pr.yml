@@ -24,7 +24,7 @@ concurrency:
 env:
   IMAGE_NAME: petclinic
   IMAGE_TAG: pr-${{ github.event.pull_request.number }}-${{ github.sha }}
-  MAVEN_OPTS: "-Xmx1g -XX:+TieredCompilation -XX:TieredStopAtLevel=1"
+  MAVEN_OPTS: "-Xmx2g -Dartifact.threads=8"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Job 1 — Build & Test
@@ -53,7 +53,7 @@ jobs:
       - name: Build and verify
         run: |
           chmod +x mvnw
-          ./mvnw clean verify -T 1C -q
+          ./mvnw clean verify -q
 
       - name: Publish test summary
         if: always()
@@ -175,11 +175,15 @@ jobs:
           rm -rf /tmp/.buildx-cache
           mv /tmp/.buildx-cache-new /tmp/.buildx-cache
 
+      - name: Get current date
+        id: date
+        run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+
       - name: Cache Trivy DB
         uses: actions/cache@v4
         with:
           path: ~/.cache/trivy
-          key: trivy-db-${{ runner.os }}-${{ github.run_id }}
+          key: trivy-db-${{ runner.os }}-${{ steps.date.outputs.date }}
           restore-keys: trivy-db-${{ runner.os }}-
 
       - name: Trivy — fail on Critical/High (hard gate)
@@ -192,7 +196,7 @@ jobs:
           ignore-unfixed: true
           trivyignores: .trivyignore
 
-      - name: Trivy — SARIF (GitHub Security tab)
+      - name: Trivy — SARIF + JSON (Security tab & summary)
         if: always()
         uses: aquasecurity/trivy-action@v0.36.0
         with:

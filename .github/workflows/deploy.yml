@@ -17,8 +17,12 @@ name: Deploy to Production
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
-  push:
-    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason for manual deploy'
+        required: false
+        default: 'Manual production deployment'
 
 env:
   REGISTRY:      ghcr.io

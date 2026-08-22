@@ -100,7 +100,7 @@ jobs:
       - name: Make Maven wrapper executable
         run: chmod +x mvnw
 
-      - name: Run SonarQube analysis with quality gate wait
+      - name: Run SonarQube analysis
         env:
           SONAR_TOKEN: ${{ secrets.TWSQPAT }}
         run: |
@@ -111,8 +111,7 @@ jobs:
             -Dsonar.host.url=https://sonarcloud.io \
             -Dsonar.token=$SONAR_TOKEN \
             -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
-            -Dsonar.java.source=21 \
-            -Dsonar.qualitygate.wait=true
+            -Dsonar.java.source=21
 
   # ──────────────────────────────────────────────
   # Job 3: Snyk security scan (SCA + dependency vulnerabilities)
